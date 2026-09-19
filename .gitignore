@@ -1,0 +1,9 @@
+venv/
+user_data/
+__pycache__/
+*.pyc
+.pytest_cache/
+.env
+.jwt_secret
+.current_jwt
+feedback.jsonl
