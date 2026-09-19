@@ -225,11 +225,15 @@ class ShufersalDriver:
             return self._mock_logged_in, cart_count
 
         try:
+            if not self.page.url.startswith("http"):
+                await self.page.goto(config.SHUFERSAL_BASE_URL, wait_until="domcontentloaded", timeout=25000)
+
             auth_res = await self.page.evaluate(
                 "() => fetch('/online/he/authentication/get-status-includes-otp').then(r => r.text()).catch(() => 'false')"
             )
-            is_logged_in = auth_res.strip().lower() == "true"
-            
+            cookies = await self.context.cookies()
+            has_session = any(c.get("name") in ("acceleratorSecureGUID", "miglogstorefrontRememberMe") for c in cookies)
+            is_logged_in = (auth_res.strip().lower() == "true") or has_session
             cart_size = await self.page.evaluate('''() => {
                 return fetch('/online/he/cart/miniCart/TOTAL')
                     .then(r => r.text())
