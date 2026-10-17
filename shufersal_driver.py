@@ -1,6 +1,8 @@
 import asyncio
 import logging
 import re
+import time
+from urllib.parse import quote
 from typing import Optional, Dict, Any, List, Tuple
 from datetime import datetime, timezone, timedelta
 
@@ -22,6 +24,9 @@ class ShufersalDriver:
         self._lock = asyncio.Lock()
         self._is_started = False
         self._csrf_token: Optional[str] = None
+        # Why the live browser is unavailable (None when live or in MOCK_MODE).
+        self._live_error: Optional[str] = None
+        self._last_live_attempt: float = 0.0
         
         # Internal mock store used when MOCK_MODE=True or for test verification
         self._mock_logged_in = True
@@ -47,10 +52,19 @@ class ShufersalDriver:
             self._is_started = True
             return
 
+        self._is_started = True
+        await self._start_live(headless=headless, user_data_dir=user_data_dir)
+
+    async def _start_live(self, headless: Optional[bool] = None, user_data_dir: Optional[str] = None) -> bool:
+        """Launches the live Playwright context. On failure, records the reason and
+        leaves the driver unavailable. It never falls back to fixture data: callers
+        get a 503 instead of fake search results, carts or login status."""
+        self._last_live_attempt = time.monotonic()
         try:
             from playwright.async_api import async_playwright
-            self.playwright = await async_playwright().start()
-            
+            if self.playwright is None:
+                self.playwright = await async_playwright().start()
+
             profile_dir = user_data_dir or config.SHUFERSAL_PROFILE_DIR
             is_headless = config.HEADLESS if headless is None else headless
 
@@ -66,9 +80,9 @@ class ShufersalDriver:
                     "--no-sandbox"
                 ]
             )
-            
+
             pages = self.context.pages
-            self.page = pages[0] if pages else await self.context.new_page()
+            page = pages[0] if pages else await self.context.new_page()
             # Import authenticated session from Chrome if available
             try:
                 imported_cookies = self._extract_chrome_session_cookies()
@@ -79,13 +93,50 @@ class ShufersalDriver:
                 logger.warning(f"Could not import Chrome session cookies: {e}")
 
             # Navigate to base URL to initialize session & extract CSRF
-            await self.page.goto(config.SHUFERSAL_BASE_URL, wait_until="domcontentloaded", timeout=45000)
+            await page.goto(config.SHUFERSAL_BASE_URL, wait_until="domcontentloaded", timeout=45000)
+            self.page = page
             await self._refresh_csrf_token()
-            self._is_started = True
+            self._live_error = None
             logger.info("Playwright persistent context started successfully.")
+            return True
         except Exception as e:
-            logger.warning(f"Failed to start live Playwright context: {e}. Falling back to mock driver mode.")
-            self._is_started = True
+            reason = str(e).splitlines()[0][:300] if str(e) else type(e).__name__
+            if "Executable doesn't exist" in str(e):
+                reason += " (run `venv/bin/python -m playwright install chromium`)"
+            self._live_error = reason
+            self.page = None
+            if self.context:
+                try:
+                    await self.context.close()
+                except Exception:
+                    pass
+                self.context = None
+            logger.error(f"Live Playwright context unavailable: {reason}. Live endpoints will return 503 until it starts.")
+            return False
+
+    LIVE_RETRY_SECONDS = 60
+
+    async def _require_live(self):
+        """Ensures a live page exists outside MOCK_MODE, retrying the browser launch
+        at most once per LIVE_RETRY_SECONDS. Raises 503 when it is unavailable."""
+        if config.MOCK_MODE or self.page:
+            return
+        if self._is_started and time.monotonic() - self._last_live_attempt >= self.LIVE_RETRY_SECONDS:
+            if await self._start_live():
+                return
+        raise APIException(
+            status_code=503,
+            code="browser_unavailable",
+            message="The live Shufersal browser session is not running; no live data is available. "
+                    + (f"Cause: {self._live_error}" if self._live_error else "The driver has not started.")
+        )
+
+    def _not_live_implemented(self, what: str):
+        raise APIException(
+            status_code=501,
+            code="not_implemented",
+            message=f"{what} is not implemented against the live site; only MOCK_MODE returns fixture data."
+        )
 
     async def stop(self):
         """Cleanly releases browser resources."""
@@ -220,7 +271,8 @@ class ShufersalDriver:
             return await self._check_login_status_unlocked()
 
     async def _check_login_status_unlocked(self) -> Tuple[bool, int]:
-        if not self.page:
+        await self._require_live()
+        if config.MOCK_MODE:
             cart_count = sum(int(item["qty"]) for item in self._mock_cart)
             return self._mock_logged_in, cart_count
 
@@ -247,8 +299,11 @@ class ShufersalDriver:
             return is_logged_in, int(cart_size or 0)
         except Exception as e:
             logger.warning(f"Error checking live login status: {e}")
-            cart_count = sum(int(item["qty"]) for item in self._mock_cart)
-            return self._mock_logged_in, cart_count
+            raise APIException(
+                status_code=502,
+                code="upstream_error",
+                message="Could not read live login status from Shufersal."
+            )
 
     # ==================== Catalog & Search ====================
 
@@ -257,9 +312,10 @@ class ShufersalDriver:
             return await self._search_products_unlocked(query, limit)
 
     async def _search_products_unlocked(self, query: str, limit: int = 20) -> List[Dict[str, Any]]:
-        if self.page:
+        await self._require_live()
+        if self.page and not config.MOCK_MODE:
             try:
-                search_url = f"{config.SHUFERSAL_BASE_URL.rstrip('/')}/online/he/search?text={query}"
+                search_url = f"{config.SHUFERSAL_BASE_URL.rstrip('/')}/online/he/search?text={quote(query, safe='')}"
                 await self.page.goto(search_url, wait_until="domcontentloaded", timeout=25000)
                 await self.page.wait_for_timeout(1500)
                 
@@ -294,7 +350,7 @@ class ShufersalDriver:
                 return items[:limit] if items else []
             except Exception as e:
                 logger.warning(f"Live search failed: {e}")
-                return []
+                raise APIException(status_code=502, code="upstream_error", message="Live Shufersal search failed.")
         if config.MOCK_MODE:
             catalog = [
                 {"id": "P12345", "name": "חלב תנובה 3% בקרטון 1 ליטר", "brand": "תנובה", "price_ils": 7.10, "unit": "יחידה", "image_url": "https://media.shufersal.co.il/images/products/milk_3.jpg", "in_stock": True},
@@ -311,11 +367,13 @@ class ShufersalDriver:
 
     async def _get_product_unlocked(self, product_id: str) -> Optional[Dict[str, Any]]:
         clean_id = product_id.replace("P_", "")
+        await self._require_live()
         if not config.MOCK_MODE and self.page:
             try:
-                prods = await self._search_products_unlocked(clean_id, limit=1)
-                if prods:
-                    p = prods[0]
+                prods = await self._search_products_unlocked(clean_id, limit=20)
+                # Only an exact code match counts; a fuzzy first hit is a different product.
+                p = next((x for x in prods if x["id"] == clean_id), None)
+                if p:
                     return {
                         "id": p["id"],
                         "name": p["name"],
@@ -326,6 +384,8 @@ class ShufersalDriver:
                         "nutrition_url": None,
                         "in_stock": p.get("in_stock", True)
                     }
+            except APIException:
+                raise
             except Exception as e:
                 logger.warning(f"Live get_product failed for {product_id}: {e}")
 
@@ -387,7 +447,8 @@ class ShufersalDriver:
             return await self._get_cart_unlocked()
 
     async def _get_cart_unlocked(self) -> Dict[str, Any]:
-        if self.page:
+        await self._require_live()
+        if self.page and not config.MOCK_MODE:
             try:
                 mini_count = await self.page.evaluate('''() => fetch('/online/he/cart/miniCart/TOTAL')
                     .then(r => r.text())
@@ -452,8 +513,11 @@ class ShufersalDriver:
                     "delivery_fee_ils": delivery_fee,
                     "total_ils": total
                 }
+            except APIException:
+                raise
             except Exception as e:
                 logger.warning(f"Error fetching live cart: {e}")
+                raise APIException(status_code=502, code="upstream_error", message="Could not read the live Shufersal cart.")
 
         if config.MOCK_MODE:
             return self._calculate_mock_cart()
@@ -468,7 +532,8 @@ class ShufersalDriver:
             return await self._add_to_cart_unlocked(product_id, qty)
 
     async def _add_to_cart_unlocked(self, product_id: str, qty: float = 1.0) -> Dict[str, Any]:
-        if self.page:
+        await self._require_live()
+        if self.page and not config.MOCK_MODE:
             try:
                 code_with_p = product_id if product_id.startswith("P_") else f"P_{product_id}"
                 search_url = f"{config.SHUFERSAL_BASE_URL.rstrip('/')}/online/he/search?text={product_id}"
@@ -525,6 +590,7 @@ class ShufersalDriver:
             return await self._update_cart_item_unlocked(line_id, qty)
 
     async def _update_cart_item_unlocked(self, line_id: str, qty: float) -> Dict[str, Any]:
+        await self._require_live()
         if not config.MOCK_MODE and self.page:
             if qty <= 0:
                 return await self._delete_cart_item_unlocked(line_id)
@@ -574,6 +640,7 @@ class ShufersalDriver:
             return await self._delete_cart_item_unlocked(line_id)
 
     async def _delete_cart_item_unlocked(self, line_id: str) -> Dict[str, Any]:
+        await self._require_live()
         if not config.MOCK_MODE and self.page:
             try:
                 deleted = await self.page.evaluate('''([lineId]) => {
@@ -616,7 +683,8 @@ class ShufersalDriver:
             return await self._clear_cart_unlocked()
 
     async def _clear_cart_unlocked(self) -> Dict[str, Any]:
-        if self.page:
+        await self._require_live()
+        if self.page and not config.MOCK_MODE:
             try:
                 await self.page.evaluate('''async () => {
                     for (let i = 0; i < 20; i++) {
@@ -645,6 +713,8 @@ class ShufersalDriver:
             return await self._get_delivery_slots_unlocked()
 
     async def _get_delivery_slots_unlocked(self) -> List[Dict[str, Any]]:
+        if not config.MOCK_MODE:
+            self._not_live_implemented("Delivery slot lookup")
         today = datetime.now()
         slots = []
         for d in range(1, 4):
@@ -670,6 +740,8 @@ class ShufersalDriver:
             return await self._get_payment_method_unlocked()
 
     async def _get_payment_method_unlocked(self) -> Dict[str, Any]:
+        if not config.MOCK_MODE:
+            self._not_live_implemented("Payment method lookup")
         return {
             "brand": "Mastercard",
             "last4": "4242",
@@ -700,6 +772,10 @@ class ShufersalDriver:
         live_quote: Dict[str, Any],
         cvv: Optional[str] = None
     ) -> Dict[str, Any]:
+        if not config.MOCK_MODE:
+            # The order flow below fabricates an order id and clears the cart; it must
+            # never run against the real account.
+            self._not_live_implemented("Order submission")
         cart = await self._get_cart_unlocked()
         live_total = cart["total_ils"]
         
