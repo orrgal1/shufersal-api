@@ -541,3 +541,51 @@ def test_completeness_uses_units_not_lines(live, client, site):
     original = site._minicart
     site._minicart = lambda: original().replace('"miniCartCount": 2', '"miniCartCount": 1')  # a line count
     assert client.get("/cart", headers=AUTH).json()["lines_complete"] is False
+
+
+def test_calls_fail_fast_while_a_watched_checkout_is_open(live, client, site, armed, watch_fast):
+    _fill(site)
+    q = _quote(client)
+    seen = {}
+
+    async def scenario():
+        import main as m
+        task = asyncio.ensure_future(live.checkout(slot_id="148340770", expected_cart_hash=q["cart_hash"],
+                                                   confirm_total_ils=q["total_ils"], place_order=True, watched=True))
+        await asyncio.sleep(0)  # let it take the lock and start waiting for Or
+        while not live._checkout_active:
+            await asyncio.sleep(0)
+        for name, call in (("add", live.add_to_cart("4131074", 1)), ("cart", live.get_cart()),
+                           ("health", live.check_login_status()), ("clear", live.clear_cart())):
+            try:
+                await asyncio.wait_for(call, timeout=1)
+                seen[name] = "ok"
+            except APIException as e:
+                seen[name] = e.code
+        site.confirm_on_url_reads = 0  # Or places the order
+        return await task
+
+    result = run(scenario())
+    assert seen == {"add": "checkout_in_progress", "cart": "checkout_in_progress",
+                    "health": "checkout_in_progress", "clear": "checkout_in_progress"}
+    assert result["status"] == "placed"
+    assert live._checkout_active is False
+    assert client.get("/cart", headers=AUTH).status_code == 200
+    assert len(site.cart) == 2  # nothing slipped in during the handover
+
+
+def test_failed_visible_relaunch_restores_headless_and_clears_flag(live, client, site, armed, watch_fast, monkeypatch):
+    _fill(site)
+    q = _quote(client)
+    real_start = live._start_live
+
+    async def start(headless=None, user_data_dir=None):
+        if headless is False:
+            return False
+        return await real_start(headless=headless, user_data_dir=user_data_dir)
+
+    monkeypatch.setattr(live, "_start_live", start)
+    res = client.post("/checkout/submit", json=_real(q, watched=True), headers={**AUTH, "Idempotency-Key": "watch-fail"})
+    assert res.status_code == 503
+    assert live._checkout_active is False and live._is_alive()
+    assert client.get("/cart", headers=AUTH).status_code == 200

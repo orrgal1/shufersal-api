@@ -1,4 +1,5 @@
 import asyncio
+from contextlib import asynccontextmanager
 import logging
 import re
 import time
@@ -56,6 +57,7 @@ class ShufersalDriver:
         self._last_live_attempt: float = 0.0
         self._last_launch_failed = False
         self._headless = True
+        self._checkout_active = False
 
         # Internal mock store used only when MOCK_MODE=True (tests/demo).
         self._mock_logged_in = True
@@ -140,6 +142,17 @@ class ShufersalDriver:
             await self._teardown_browser()
             logger.error(f"Live Playwright context unavailable: {reason}. Live endpoints will return 503 until it starts.")
             return False
+
+    @asynccontextmanager
+    async def _guard(self):
+        """The driver lock for every call except checkout. While a checkout
+        (above all a watched handover, which can wait many minutes) is open,
+        calls fail fast with 409 instead of queueing behind it."""
+        if self._checkout_active:
+            raise APIException(status_code=409, code="checkout_in_progress",
+                               message="A checkout is in progress; retry when it has finished.")
+        async with self._lock:
+            yield
 
     def _mark_dead(self, reason: str, owner: Any = None):
         # Events from a context/page we already replaced must not kill the new one.
@@ -315,7 +328,7 @@ class ShufersalDriver:
     # ==================== Health & Login ====================
 
     async def check_login_status(self) -> Tuple[bool, int]:
-        async with self._lock:
+        async with self._guard():
             return await self._check_login_status_unlocked()
 
     async def _check_login_status_unlocked(self) -> Tuple[bool, int]:
@@ -337,7 +350,7 @@ class ShufersalDriver:
             raise _upstream(f"Unexpected search response: {e}")
 
     async def search_products(self, query: str, limit: int = 20) -> List[Dict[str, Any]]:
-        async with self._lock:
+        async with self._guard():
             return await self._search_products_unlocked(query, limit)
 
     async def _search_products_unlocked(self, query: str, limit: int = 20) -> List[Dict[str, Any]]:
@@ -358,7 +371,7 @@ class ShufersalDriver:
         return find_exact(await self._search_json(code, 20), code)
 
     async def get_product(self, product_id: str) -> Optional[Dict[str, Any]]:
-        async with self._lock:
+        async with self._guard():
             return await self._get_product_unlocked(product_id)
 
     async def _get_product_unlocked(self, product_id: str) -> Optional[Dict[str, Any]]:
@@ -498,7 +511,7 @@ class ShufersalDriver:
             )
 
     async def get_cart(self) -> Dict[str, Any]:
-        async with self._lock:
+        async with self._guard():
             return await self._get_cart_unlocked()
 
     async def _get_cart_unlocked(self) -> Dict[str, Any]:
@@ -571,7 +584,7 @@ class ShufersalDriver:
         before any write. Re-applying a recorded plan reconciles: lines already
         at target are left alone, lines still at their planned starting
         quantity are written, and anything else is a 409."""
-        async with self._lock:
+        async with self._guard():
             if plan is None:
                 plan = await self._plan_add(items, clear_first)
                 if on_plan:
@@ -631,7 +644,7 @@ class ShufersalDriver:
     # ---- updates and removals (product code is authoritative) ----
 
     async def update_cart_item(self, line_id: str, qty: float, product_code: Optional[str] = None) -> Dict[str, Any]:
-        async with self._lock:
+        async with self._guard():
             return await self._update_cart_item_unlocked(line_id, qty, product_code)
 
     async def _update_cart_item_unlocked(self, line_id: str, qty: float, product_code: Optional[str]) -> Dict[str, Any]:
@@ -649,7 +662,7 @@ class ShufersalDriver:
         return after
 
     async def delete_cart_item(self, line_id: str, product_code: Optional[str] = None) -> Dict[str, Any]:
-        async with self._lock:
+        async with self._guard():
             return await self._delete_cart_item_unlocked(line_id, product_code)
 
     async def _delete_cart_item_unlocked(self, line_id: str, product_code: Optional[str]) -> Dict[str, Any]:
@@ -663,7 +676,7 @@ class ShufersalDriver:
         return after
 
     async def clear_cart(self) -> Dict[str, Any]:
-        async with self._lock:
+        async with self._guard():
             return await self._clear_cart_unlocked()
 
     async def _clear_cart_unlocked(self) -> Dict[str, Any]:
@@ -683,7 +696,7 @@ class ShufersalDriver:
     # ==================== Delivery & Payment ====================
 
     async def get_delivery_slots(self) -> List[Dict[str, Any]]:
-        async with self._lock:
+        async with self._guard():
             return await self._get_delivery_slots_unlocked()
 
     async def _get_delivery_slots_unlocked(self) -> List[Dict[str, Any]]:
@@ -696,7 +709,7 @@ class ShufersalDriver:
             raise _upstream(f"Unexpected delivery slot response: {e}")
 
     async def get_payment_method(self) -> Dict[str, Any]:
-        async with self._lock:
+        async with self._guard():
             return public_payment(await self._get_payment_method_unlocked())
 
     async def _get_payment_method_unlocked(self) -> Dict[str, Any]:
@@ -753,7 +766,7 @@ class ShufersalDriver:
     # ==================== Checkout ====================
 
     async def checkout_summary(self, slot_id: str) -> Dict[str, Any]:
-        async with self._lock:
+        async with self._guard():
             return await self._checkout_summary_unlocked(slot_id)
 
     async def _checkout_summary_unlocked(self, slot_id: str) -> Dict[str, Any]:
@@ -803,21 +816,25 @@ class ShufersalDriver:
         place_order: bool,
         watched: bool = False,
     ) -> Dict[str, Any]:
-        async with self._lock:
+        async with self._guard():
+            self._checkout_active = True
             relaunched = False
-            if watched and not config.MOCK_MODE and self._headless:
-                # The persistent profile can be open in one browser only, so the
-                # checkout step relaunches it headed (same session) and reverts after.
-                await self._require_live()
-                if not await self._start_live(headless=False):
-                    raise APIException(status_code=503, code="browser_unavailable",
-                                       message="Could not open a visible browser window for the watched checkout.")
-                relaunched = True
             try:
+                if watched and not config.MOCK_MODE and self._headless:
+                    # The persistent profile can be open in one browser only, so the
+                    # checkout step relaunches it headed (same session) and reverts after.
+                    await self._require_live()
+                    relaunched = True
+                    if not await self._start_live(headless=False):
+                        raise APIException(status_code=503, code="browser_unavailable",
+                                           message="Could not open a visible browser window for the watched checkout.")
                 return await self._checkout_unlocked(slot_id, expected_cart_hash, confirm_total_ils, place_order, watched)
             finally:
-                if relaunched:
-                    await self._start_live(headless=config.HEADLESS)
+                try:
+                    if relaunched:
+                        await self._start_live(headless=config.HEADLESS)
+                finally:
+                    self._checkout_active = False
 
     async def _page_state(self) -> Dict[str, Any]:
         return await self.page.evaluate(self.CHECKOUT_STATE_JS)

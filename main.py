@@ -42,7 +42,7 @@ SAFE_CHECKOUT_CODES = {
     "total_drift", "quote_expired_or_invalid", "cart_mismatch", "cart_empty", "slot_unavailable",
     "checkout_blocked", "confirmation_required", "idempotency_key_required", "idempotency_key_used",
     "live_checkout_disabled", "order_rejected", "checkout_not_configured", "browser_unavailable",
-    "slot_select_failed", "checkout_unreachable", "quote_consumed", "cart_incomplete", "payment_method_unavailable", "invalid_input",
+    "slot_select_failed", "checkout_unreachable", "quote_consumed", "cart_incomplete", "checkout_in_progress", "payment_method_unavailable", "invalid_input",
 }
 
 logging.basicConfig(
