@@ -44,3 +44,11 @@ SHUFERSAL_BASE_URL = os.getenv("SHUFERSAL_BASE_URL", "https://www.shufersal.co.i
 
 # Loaded from the local .env at service startup. Never accept it from API callers.
 SHUFERSAL_CVV = os.getenv("SHUFERSAL_CVV", "")
+
+# Real order placement stays off until Or has watched a supervised dry run.
+# Dry runs work regardless; placing an order also needs confirm=true and a
+# fresh Idempotency-Key per order.
+LIVE_CHECKOUT_ENABLED = os.getenv("SHUFERSAL_LIVE_CHECKOUT_ENABLED", "false").strip().lower() in ("true", "1", "yes")
+
+# Durable record of every order-submission Idempotency-Key (survives restarts).
+CHECKOUT_LEDGER = os.getenv("SHUFERSAL_CHECKOUT_LEDGER", "./.runtime/checkout_ledger.sqlite3")

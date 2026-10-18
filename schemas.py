@@ -120,17 +120,44 @@ class CheckoutQuoteResponse(BaseModel):
     item_count: int
     quote_id: str
     expires_at: str
+    cart_hash: Optional[str] = None
+    items: List[Dict[str, Any]] = []
+    slot: Optional[Dict[str, Any]] = None
+    payment: Optional[Dict[str, Any]] = None
+    prices_complete: bool = True
+    total_is_estimate: bool = True
+
+class ExpectedItem(BaseModel):
+    product_id: str
+    qty: float
 
 class CheckoutSubmitRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     quote_id: str
     confirm_total_ils: float
+    # The caller's view of the cart: the quote's cart_hash, or the item list.
+    expected_cart_hash: Optional[str] = None
+    expected_items: Optional[List[ExpectedItem]] = None
+    dry_run: bool = True
+    confirm: bool = False
+
+    @model_validator(mode="after")
+    def require_expectation(self):
+        if self.expected_cart_hash is None and self.expected_items is None:
+            raise ValueError("expected_cart_hash or expected_items is required")
+        return self
 
 class CheckoutSubmitResponse(BaseModel):
-    order_id: str
-    eta: str
-    total_ils: float
+    status: str  # dry_run | placed | placed_unconfirmed | three_ds_required | outcome_unknown
+    dry_run: bool
+    # The site's order number, parsed from its confirmation page; never invented.
+    order_id: Optional[str] = None
+    total_ils: Optional[float] = None
+    site_total_ils: Optional[float] = None
+    summary: Dict[str, Any] = {}
+    checks: Dict[str, Any] = {}
+    blockers: List[str] = []
 
 class FeedbackRequest(BaseModel):
     message: str

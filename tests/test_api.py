@@ -144,88 +144,72 @@ def test_delivery_and_payment():
     assert len(pay_data["last4"]) == 4
 
 def test_checkout_quote_and_submit_drift_protection(monkeypatch):
-    """Verify checkout uses only local CVV and keeps drift/idempotency guards."""
+    """Checkout uses only the local CVV, defaults to dry run, and keeps drift,
+    cart-match and single-use idempotency guards."""
     client.delete("/cart", headers=AUTH_HEADERS)
-    add_res = client.post("/cart/items", json={"product_id": "P12345", "qty": 1.0}, headers=AUTH_HEADERS)
-    cart = add_res.json()
-
+    client.post("/cart/items", json={"product_id": "P12345", "qty": 1.0}, headers=AUTH_HEADERS)
     slots = client.get("/delivery/slots", headers=AUTH_HEADERS).json()["slots"]
-    slot_id = slots[0]["id"]
+    slot_id = next(s["id"] for s in slots if s["available"])
 
-    quote_res = client.post(f"/checkout/quote?delivery_slot_id={slot_id}", headers=AUTH_HEADERS)
-    assert quote_res.status_code == 200
-    quote = quote_res.json()
-    quote_id = quote["quote_id"]
-    correct_total = quote["total_ils"]
+    quote = client.post(f"/checkout/quote?delivery_slot_id={slot_id}", headers=AUTH_HEADERS).json()
+    quote_id, total, chash = quote["quote_id"], quote["total_ils"], quote["cart_hash"]
+    assert quote["payment"]["last4"] == "4242" and "payment_info_id" not in quote["payment"]
+    base = {"quote_id": quote_id, "confirm_total_ils": total, "expected_cart_hash": chash}
+    real = {**base, "dry_run": False, "confirm": True}
 
-    original_submit_order = shufersal_driver.submit_order
-    submit_order = AsyncMock(
-        return_value={"order_id": "MOCK-ORDER", "eta": "soon", "total_ils": correct_total,
-                      "cvv": "042"}
-    )
-    monkeypatch.setattr(shufersal_driver, "submit_order", submit_order)
+    checkout = AsyncMock(wraps=shufersal_driver.checkout)
+    monkeypatch.setattr(shufersal_driver, "checkout", checkout)
 
-    # Local checkout configuration must fail closed before the driver is called.
+    # An expected cart is mandatory and must match the quote.
+    assert client.post("/checkout/submit", json={"quote_id": quote_id, "confirm_total_ils": total},
+                       headers=AUTH_HEADERS).status_code == 400
+    res = client.post("/checkout/submit", json={**base, "expected_cart_hash": "0" * 16}, headers=AUTH_HEADERS)
+    assert res.status_code == 409 and res.json()["error"]["code"] == "cart_mismatch"
+    res = client.post("/checkout/submit", json={"quote_id": quote_id, "confirm_total_ils": total,
+                                                "expected_items": [{"product_id": "P12345", "qty": 1}]},
+                      headers=AUTH_HEADERS)
+    assert res.status_code == 200 and res.json()["status"] == "dry_run"
+
+    # Default is a dry run: no CVV, no key, no order id.
     monkeypatch.setattr(config, "SHUFERSAL_CVV", "")
-    missing_res = client.post(
-        "/checkout/submit",
-        json={
-            "quote_id": quote_id,
-            "confirm_total_ils": correct_total,
-        },
-        headers=AUTH_HEADERS,
-    )
-    assert missing_res.status_code == 503
-    assert missing_res.json()["error"]["code"] == "checkout_not_configured"
-    assert submit_order.await_count == 0
+    dry = client.post("/checkout/submit", json=base, headers=AUTH_HEADERS)
+    assert dry.status_code == 200, dry.text
+    assert dry.json()["status"] == "dry_run" and dry.json()["order_id"] is None
+    assert checkout.await_args.kwargs["place_order"] is False
+
+    # A real order needs confirm=true and an Idempotency-Key, and a configured CVV.
+    calls = checkout.await_count
+    assert client.post("/checkout/submit", json={**real, "confirm": False},
+                       headers={**AUTH_HEADERS, "Idempotency-Key": "k0"}).json()["error"]["code"] == "confirmation_required"
+    assert client.post("/checkout/submit", json=real, headers=AUTH_HEADERS).json()["error"]["code"] == "idempotency_key_required"
+    missing = client.post("/checkout/submit", json=real, headers={**AUTH_HEADERS, "Idempotency-Key": "k1"})
+    assert missing.status_code == 503 and missing.json()["error"]["code"] == "checkout_not_configured"
+    assert checkout.await_count == calls
 
     monkeypatch.setattr(config, "SHUFERSAL_CVV", "042")
     # Caller supplied payment secrets are rejected without reflecting them.
-    bad_res = client.post(
-        "/checkout/submit",
-        json={"quote_id": quote_id, "confirm_total_ils": correct_total, "cvv": "123"},
-        headers=AUTH_HEADERS,
-    )
-    assert bad_res.status_code == 400
-    assert "123" not in bad_res.text
-    assert submit_order.await_count == 0
+    bad = client.post("/checkout/submit", json={**real, "cvv": "123"}, headers={**AUTH_HEADERS, "Idempotency-Key": "k2"})
+    assert bad.status_code == 400 and "123" not in bad.text
+    assert checkout.await_count == calls
 
-    # Drift -> 409 before order placement.
-    monkeypatch.setattr(shufersal_driver, "submit_order", original_submit_order)
-    drift_res = client.post(
-        "/checkout/submit",
-        json={
-            "quote_id": quote_id,
-            "confirm_total_ils": correct_total + 10.0,
-        },
-        headers=AUTH_HEADERS
-    )
-    assert drift_res.status_code == 409
-    assert drift_res.json()["error"]["code"] == "total_drift"
+    # Drift -> 409 before order placement; the key is burned.
+    drift = client.post("/checkout/submit", json={**real, "confirm_total_ils": total + 10.0},
+                        headers={**AUTH_HEADERS, "Idempotency-Key": "k3"})
+    assert drift.status_code == 409 and drift.json()["error"]["code"] == "total_drift"
+    reuse = client.post("/checkout/submit", json=real, headers={**AUTH_HEADERS, "Idempotency-Key": "k3"})
+    assert reuse.status_code == 409 and reuse.json()["error"]["code"] == "idempotency_key_used"
 
-    monkeypatch.setattr(shufersal_driver, "submit_order", submit_order)
-    success_res = client.post(
-        "/checkout/submit",
-        json={
-            "quote_id": quote_id,
-            "confirm_total_ils": correct_total,
-        },
-        headers={**AUTH_HEADERS, "Idempotency-Key": "checkout-test-secret-filter"}
-    )
-    assert success_res.status_code == 200
-    submit_data = success_res.json()
-    assert submit_data["order_id"] == "MOCK-ORDER"
-    assert submit_data["total_ils"] == correct_total
-    assert "042" not in success_res.text
-    assert submit_order.await_args.kwargs["cvv"] == "042"
-    cached_res = client.post(
-        "/checkout/submit",
-        json={"quote_id": quote_id, "confirm_total_ils": correct_total},
-        headers={**AUTH_HEADERS, "Idempotency-Key": "checkout-test-secret-filter"},
-    )
-    assert cached_res.status_code == 200
-    assert "042" not in cached_res.text
-    assert submit_order.await_count == 1
+    ok = client.post("/checkout/submit", json=real, headers={**AUTH_HEADERS, "Idempotency-Key": "k4"})
+    assert ok.status_code == 200, ok.text
+    assert ok.json()["status"] == "placed" and ok.json()["order_id"].startswith("MOCK-")
+    assert "042" not in ok.text
+    assert checkout.await_args.kwargs["cvv"] == "042"
+    calls = checkout.await_count
+    replay = client.post("/checkout/submit", json=real, headers={**AUTH_HEADERS, "Idempotency-Key": "k4"})
+    assert replay.status_code == 200 and replay.json() == ok.json()
+    assert checkout.await_count == calls  # the same key never submits twice
+    # The cart is untouched by checkout.
+    assert len(client.get("/cart", headers=AUTH_HEADERS).json()["items"]) == 1
 
 
 def test_setup_checkout_cvv_file_is_private_and_preserves_settings(tmp_path):

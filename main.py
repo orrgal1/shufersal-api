@@ -33,6 +33,17 @@ from schemas import (
 from security import verify_bearer_token, log_mutation, APIException
 from idempotency import idempotency_store, quote_store
 from shufersal_driver import shufersal_driver
+from shufersal_parsers import cart_hash
+from checkout_ledger import CheckoutLedger
+
+checkout_ledger = CheckoutLedger(config.CHECKOUT_LEDGER)
+FINAL_SUBMIT_STATES = {"placed", "placed_unconfirmed", "three_ds_required", "outcome_unknown"}
+SAFE_CHECKOUT_CODES = {
+    "total_drift", "quote_expired_or_invalid", "cart_mismatch", "cart_empty", "slot_unavailable",
+    "checkout_blocked", "confirmation_required", "idempotency_key_required", "idempotency_key_used",
+    "live_checkout_disabled", "order_rejected", "checkout_not_configured", "browser_unavailable",
+    "slot_select_failed", "checkout_unreachable", "payment_method_unavailable", "invalid_input",
+}
 
 logging.basicConfig(
     level=logging.INFO,
@@ -64,10 +75,9 @@ async def api_exception_handler(request: Request, exc: APIException):
     message = exc.message
     if request.url.path == "/checkout/submit":
         # Driver errors must not be able to reflect a caller's payment secret.
-        message = {
-            "total_drift": "The live total differs from the confirmed quote.",
-            "quote_expired_or_invalid": "Quote is invalid or expired.",
-        }.get(exc.code, "Checkout could not be completed.")
+        # Only server-generated messages from known codes pass through.
+        if exc.code not in SAFE_CHECKOUT_CODES:
+            message = "Checkout could not be completed."
     return JSONResponse(
         status_code=exc.status_code,
         content={"error": {"code": exc.code, "message": message}}
@@ -272,34 +282,31 @@ async def create_checkout_quote(
     delivery_slot_id: str,
     idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key")
 ):
-    """POST /checkout/quote -> {delivery_slot_id, subtotal_ils, delivery_fee_ils, total_ils, item_count, quote_id, expires_at}"""
+    """POST /checkout/quote?delivery_slot_id=<slot id from /delivery/slots>
+    Read-only. -> {quote_id, cart_hash, items, slot, payment (masked), subtotal_ils,
+    delivery_fee_ils, total_ils (estimate: site subtotal + slot fee), expires_at}"""
     if idempotency_key:
         cached = idempotency_store.get(idempotency_key)
         if cached:
             log_mutation("POST", "/checkout/quote", cached["status_code"], idempotency_key, {"cached": True})
             return JSONResponse(status_code=cached["status_code"], content=cached["body"])
 
-    cart = await shufersal_driver.get_cart()
-    slots = await shufersal_driver.get_delivery_slots()
-    selected_slot = next((s for s in slots if s["id"] == delivery_slot_id), None)
-    if not selected_slot or not selected_slot["available"]:
-        raise APIException(
-            status_code=status.HTTP_409_CONFLICT,
-            code="slot_unavailable",
-            message=f"Delivery slot {delivery_slot_id} is not offered or not available."
-        )
-    delivery_fee = selected_slot["fee_ils"]
-    total = cart["subtotal_ils"] + delivery_fee
-    item_count = sum(int(item["qty"]) for item in cart["items"])
-
+    summary = await shufersal_driver.checkout_summary(delivery_slot_id)
     quote = quote_store.create_quote(
         delivery_slot_id=delivery_slot_id,
-        subtotal_ils=cart["subtotal_ils"],
-        delivery_fee_ils=delivery_fee,
-        total_ils=total,
-        item_count=item_count
+        subtotal_ils=summary["subtotal_ils"],
+        delivery_fee_ils=summary["delivery_fee_ils"],
+        total_ils=summary["estimated_total_ils"],
+        item_count=sum(int(round(i["qty"])) for i in summary["items"]),
     )
-
+    quote.update({
+        "cart_hash": summary["cart_hash"],
+        "items": summary["items"],
+        "slot": summary["slot"],
+        "payment": summary["payment"],
+        "prices_complete": summary["prices_complete"],
+        "total_is_estimate": True,
+    })
     if idempotency_key:
         idempotency_store.set(idempotency_key, 200, quote)
 
@@ -312,16 +319,13 @@ async def submit_checkout(
     idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key")
 ):
     """
-    POST /checkout/submit body:{quote_id, confirm_total_ils}
-    Places order ONLY if confirm_total_ils == live re-read site total and quote not expired -> {order_id, eta, total_ils}. Otherwise 409.
+    POST /checkout/submit body:{quote_id, confirm_total_ils, expected_cart_hash | expected_items,
+                                dry_run (default true), confirm (default false)}
+    dry_run=true walks checkout (verify cart, select the slot, open checkout, read the
+    site total) and stops before placing the order. Placing a real order needs
+    dry_run=false, confirm=true, a never-used Idempotency-Key and
+    SHUFERSAL_LIVE_CHECKOUT_ENABLED=true. The cart is never modified.
     """
-    if idempotency_key:
-        cached = idempotency_store.get(idempotency_key)
-        if cached:
-            log_mutation("POST", "/checkout/submit", cached["status_code"], None, {"cached": True})
-            return JSONResponse(status_code=cached["status_code"], content=cached["body"])
-
-    # 1. Retrieve quote & check expiration
     quote = quote_store.get_quote(payload.quote_id)
     if not quote:
         raise APIException(
@@ -330,36 +334,80 @@ async def submit_checkout(
             message=f"Quote {payload.quote_id} not found or has expired"
         )
 
-    # The payment secret is local to this service. Fail before touching the driver
-    # if it has not been configured or is malformed.
-    cvv = config.SHUFERSAL_CVV
-    if not (len(cvv) in (3, 4) and cvv.isascii() and cvv.isdecimal()):
-        raise APIException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            code="checkout_not_configured",
-            message="Checkout is not configured."
+    expected_hash = payload.expected_cart_hash
+    if payload.expected_items is not None:
+        items_hash = cart_hash([i.model_dump() for i in payload.expected_items])
+        if expected_hash and expected_hash != items_hash:
+            raise APIException(status_code=400, code="invalid_input",
+                               message="expected_cart_hash and expected_items disagree.")
+        expected_hash = items_hash
+    if expected_hash != quote.get("cart_hash"):
+        raise APIException(status_code=409, code="cart_mismatch",
+                           message="The expected cart does not match the quoted cart.")
+
+    place_order = not payload.dry_run
+    if place_order:
+        if payload.confirm is not True:
+            raise APIException(status_code=400, code="confirmation_required",
+                               message="Placing an order needs confirm=true.")
+        if not idempotency_key:
+            raise APIException(status_code=400, code="idempotency_key_required",
+                               message="Placing an order needs an Idempotency-Key header.")
+        if not (config.LIVE_CHECKOUT_ENABLED or config.MOCK_MODE):
+            raise APIException(status_code=403, code="live_checkout_disabled",
+                               message="Live order placement is disabled on this service.")
+        # The payment secret is local to this service. Fail before touching the driver
+        # if it has not been configured or is malformed.
+        cvv = config.SHUFERSAL_CVV
+        if not (len(cvv) in (3, 4) and cvv.isascii() and cvv.isdecimal()):
+            raise APIException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                code="checkout_not_configured",
+                message="Checkout is not configured."
+            )
+        previous = checkout_ledger.claim(idempotency_key, payload.quote_id)
+        if previous is not None:
+            if previous["state"] in FINAL_SUBMIT_STATES and previous["result"]:
+                log_mutation("POST", "/checkout/submit", previous["http_status"], None, {"replayed": True})
+                return JSONResponse(status_code=previous["http_status"], content=previous["result"])
+            raise APIException(status_code=409, code="idempotency_key_used",
+                               message=f"This Idempotency-Key was already used (state: {previous['state']}). Use a new key.")
+    else:
+        cvv = None
+
+    try:
+        result = await shufersal_driver.checkout(
+            slot_id=quote["delivery_slot_id"],
+            expected_cart_hash=expected_hash,
+            confirm_total_ils=payload.confirm_total_ils,
+            place_order=place_order,
+            cvv=cvv,
         )
+    except APIException as exc:
+        if place_order:
+            checkout_ledger.finish(idempotency_key, f"failed:{exc.code}", exc.status_code, {})
+        raise
+    except Exception:
+        if place_order:
+            checkout_ledger.finish(idempotency_key, "outcome_unknown", 502, {})
+        raise
 
-    # 2. Check total drift against live re-read total
-    result = await shufersal_driver.submit_order(
-        quote_id=payload.quote_id,
-        confirm_total_ils=payload.confirm_total_ils,
-        live_quote=quote,
-        cvv=cvv
+    response = CheckoutSubmitResponse(
+        status=result["status"],
+        dry_run=not place_order,
+        order_id=result.get("order_id"),
+        total_ils=result.get("site_total_ils"),
+        site_total_ils=result.get("site_total_ils"),
+        summary=result["summary"],
+        checks=result.get("checks") or {},
+        blockers=result.get("blockers") or [],
     )
-
-    response = CheckoutSubmitResponse(**result)
-    if idempotency_key:
-        idempotency_store.set(idempotency_key, 200, response.model_dump())
-
-    log_mutation(
-        "POST",
-        "/checkout/submit",
-        200,
-        None,
-        {}
-    )
-    return response
+    http_status = 202 if response.status in ("three_ds_required", "outcome_unknown", "placed_unconfirmed") else 200
+    body = response.model_dump()
+    if place_order:
+        checkout_ledger.finish(idempotency_key, response.status, http_status, body)
+    log_mutation("POST", "/checkout/submit", http_status, None, {"status": response.status, "dry_run": not place_order})
+    return JSONResponse(status_code=http_status, content=body)
 # ==================== Feedback ====================
 
 @app.post("/feedback", response_model=FeedbackResponse)

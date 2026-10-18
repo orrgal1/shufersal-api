@@ -11,11 +11,14 @@ from security import APIException
 from shufersal_parsers import (
     ParseError,
     cart_hash,
+    classify_place_order,
     clean_code,
+    extract_site_total,
     find_exact,
     parse_cart_entries,
     parse_home_delivery_slots,
     parse_minicart,
+    parse_order_number,
     parse_payment_method,
     parse_search_results,
     public_payment,
@@ -661,25 +664,166 @@ class ShufersalDriver:
 
     # ==================== Checkout ====================
 
-    async def submit_order(
+    async def checkout_summary(self, slot_id: str) -> Dict[str, Any]:
+        async with self._lock:
+            return await self._checkout_summary_unlocked(slot_id)
+
+    async def _checkout_summary_unlocked(self, slot_id: str) -> Dict[str, Any]:
+        """Read-only: the cart, the chosen slot and the masked payment method."""
+        cart = await self._get_cart_unlocked()
+        if not cart["items"]:
+            raise APIException(status_code=409, code="cart_empty", message="The cart is empty.")
+        slots = await self._get_delivery_slots_unlocked()
+        slot = next((s for s in slots if s["id"] == str(slot_id)), None)
+        if not slot or not slot["available"]:
+            raise APIException(status_code=409, code="slot_unavailable",
+                               message=f"Delivery slot {slot_id} is not offered or not available.")
+        payment = await self._get_payment_method_unlocked()
+        return {
+            "items": [{k: i[k] for k in ("product_id", "name", "qty", "unit_price_ils", "line_total_ils")} for i in cart["items"]],
+            "item_count": cart["item_count"],
+            "cart_hash": cart["cart_hash"],
+            "prices_complete": cart["prices_complete"],
+            "subtotal_ils": cart["subtotal_ils"],
+            "delivery_fee_ils": slot["fee_ils"],
+            "estimated_total_ils": round(cart["subtotal_ils"] + slot["fee_ils"], 2),
+            "slot": {k: slot[k] for k in ("id", "date", "window", "fee_ils") if k in slot},
+            "payment": public_payment(payment),
+        }
+
+    async def checkout(
         self,
-        quote_id: str,
+        *,
+        slot_id: str,
+        expected_cart_hash: str,
         confirm_total_ils: float,
-        live_quote: Dict[str, Any],
-        cvv: Optional[str] = None
+        place_order: bool,
+        cvv: Optional[str] = None,
     ) -> Dict[str, Any]:
         async with self._lock:
-            if not config.MOCK_MODE:
-                raise APIException(status_code=501, code="not_implemented",
-                                   message="Order submission is not implemented against the live site.")
-            cart = self._calculate_mock_cart()
-            live_total = round(cart["subtotal_ils"] + live_quote["delivery_fee_ils"], 2)
-            if round(confirm_total_ils, 2) != live_total or round(live_quote["total_ils"], 2) != live_total:
-                raise APIException(status_code=409, code="total_drift",
-                                   message="The live total differs from the confirmed quote.")
-            if not cvv:
-                raise APIException(status_code=400, code="cvv_required", message="CVV is not configured.")
-            return {"order_id": f"MOCK-{quote_id[-6:]}", "eta": live_quote["delivery_slot_id"], "total_ils": live_total}
+            return await self._checkout_unlocked(slot_id, expected_cart_hash, confirm_total_ils, place_order, cvv)
+
+    async def _checkout_unlocked(self, slot_id, expected_cart_hash, confirm_total_ils, place_order, cvv):
+        """Walks checkout: verify cart -> select slot -> open checkout -> read the
+        site total -> (only if place_order) place the order. Never touches the
+        cart contents. place_order=False stops before the final step."""
+        summary = await self._checkout_summary_unlocked(slot_id)
+        if summary["cart_hash"] != expected_cart_hash:
+            raise APIException(status_code=409, code="cart_mismatch",
+                               message="The cart no longer matches the expected contents.")
+
+        if config.MOCK_MODE:
+            site_total = summary["estimated_total_ils"]
+            result = {"summary": summary, "site_total_ils": site_total, "blockers": [],
+                      "checks": {"reached_checkout": True, "three_ds_enabled": False, "cvv_field_present": False}}
+            if abs(site_total - confirm_total_ils) > 0.01:
+                raise APIException(status_code=409, code="total_drift", message="The live total differs from the confirmed quote.")
+            if not place_order:
+                return dict(result, status="dry_run", order_id=None)
+            return dict(result, status="placed", order_id=f"MOCK-{expected_cart_hash[:6]}")
+
+        blockers: List[str] = []
+        # 1. Select the delivery slot on the cart (the site's own preselection call).
+        status, _, text = await self._fetch(
+            f"{BASE}/timeSlot/preselection/postHomeDeliverySlot",
+            method="POST",
+            body=json.dumps({"homeDeliveryTimeSlot": {"code": str(slot_id), "sourceOfSupply": "DIRECT"}}),
+            content_type="application/json",
+        )
+        if status != 200:
+            raise _upstream(f"Selecting the delivery slot returned HTTP {status}.", code="slot_select_failed")
+
+        # 2. Open the checkout page the way the cart's checkout button does.
+        try:
+            await self.page.goto(config.SHUFERSAL_BASE_URL + BASE + "/checkout", wait_until="domcontentloaded", timeout=45000)
+            await self.page.wait_for_timeout(4000)
+            page_state = await self.page.evaluate("""() => {
+                const visible = (sel) => [...document.querySelectorAll(sel)].some(e => e.offsetParent !== null);
+                return {
+                    path: location.pathname,
+                    reauth: visible('.miglog-pwd-modal #j_password, #checkoutPwd, #smsCodeInput'),
+                    cvv: !!document.querySelector('input[name*="cvv" i], input[id*="cvv" i], iframe[src*="payme" i]'),
+                    threeDS: !!(window.miglog && window.miglog.threeDSecure && window.miglog.threeDSecure.enabled),
+                    threeDSTest: !!(window.miglog && window.miglog.threeDSecure && window.miglog.threeDSecure.isTestMode),
+                };
+            }""")
+        except APIException:
+            raise
+        except Exception as e:
+            raise _upstream(f"Opening the checkout page failed: {str(e)[:120]}", code="checkout_unreachable")
+        path = str(page_state.get("path") or "")
+        reached = "checkout" in path
+        if not reached:
+            blockers.append(f"checkout page redirected to {path or 'unknown'}")
+        if page_state.get("reauth"):
+            blockers.append("the site asks for the account password or an SMS code before checkout")
+        if page_state.get("cvv"):
+            blockers.append("the checkout page shows a CVV / PayMe card field, which this service does not fill yet")
+
+        # 3. The site's own total for the order.
+        site_total = None
+        if reached:
+            try:
+                status, _, text = await self._fetch(f"{BASE}/checkout/costSummary/direct")
+                if status == 200:
+                    site_total = extract_site_total(json.loads(text))
+            except (APIException, ValueError):
+                site_total = None
+        if site_total is None:
+            blockers.append("could not read the order total from the checkout page")
+        elif abs(site_total - confirm_total_ils) > 0.01:
+            raise APIException(status_code=409, code="total_drift",
+                               message=f"The site total ({site_total} ILS) differs from confirm_total_ils.")
+
+        result = {
+            "summary": summary,
+            "site_total_ils": site_total,
+            "blockers": blockers,
+            "checks": {"reached_checkout": reached, "three_ds_enabled": bool(page_state.get("threeDS")),
+                       "cvv_field_present": bool(page_state.get("cvv"))},
+        }
+        if not place_order:
+            return dict(result, status="dry_run", order_id=None)
+
+        # ---------- Real order placement (only with confirm + fresh key + enabled flag) ----------
+        if blockers:
+            raise APIException(status_code=409, code="checkout_blocked",
+                               message="Checkout cannot be completed automatically: " + "; ".join(blockers))
+        jwt = ""
+        if page_state.get("threeDS"):
+            try:
+                jwt = await self.page.evaluate(
+                    "(t) => PayMe.clientData(t).then(r => (r && r.hash) || '').catch(() => '')",
+                    bool(page_state.get("threeDSTest")))
+            except Exception:
+                jwt = ""
+        status, _, text = await self._fetch(
+            f"{BASE}/checkout/placeOrder?jwtPayme={quote(jwt or '', safe='')}&after3ds=false")
+        try:
+            outcome = classify_place_order(json.loads(text)) if status == 200 else {"outcome": "unknown"}
+        except ValueError:
+            outcome = {"outcome": "unknown"}
+
+        if outcome["outcome"] == "placed":
+            redirect = outcome["redirect"]
+            order_id = None
+            try:
+                await self.page.goto(config.SHUFERSAL_BASE_URL + BASE + redirect if redirect.startswith("/") else redirect,
+                                     wait_until="domcontentloaded", timeout=45000)
+                order_id = parse_order_number(self.page.url, await self.page.content())
+            except Exception as e:
+                logger.warning(f"Order placed but confirmation page could not be read: {str(e)[:120]}")
+            if order_id is None:
+                order_id = parse_order_number(redirect, "")
+            return dict(result, status="placed" if order_id else "placed_unconfirmed", order_id=order_id)
+        if outcome["outcome"] == "three_ds_required":
+            return dict(result, status="three_ds_required", order_id=None)
+        if outcome["outcome"] == "rejected":
+            raise APIException(status_code=409, code="order_rejected",
+                               message=f"The site rejected the order ({outcome.get('code')}).")
+        # The request went out but the answer is not understood: the order may exist.
+        return dict(result, status="outcome_unknown", order_id=None)
+
 
 def _fmt_qty(qty: float) -> str:
     q = float(qty)

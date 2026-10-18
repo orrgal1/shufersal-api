@@ -242,3 +242,48 @@ def parse_order_number(url: str, html: str) -> Optional[str]:
     text = re.sub(r"<[^>]+>", " ", html or "")
     m = ORDER_TEXT_RE.search(text)
     return m.group(1) if m else None
+
+
+# ==================== Checkout ====================
+
+TOTAL_KEYS = ("totalPriceWithDelivery", "totalPriceWithTax", "totalPrice", "total")
+
+
+def extract_site_total(data: Any) -> Optional[float]:
+    """Finds the order total in a checkout cost-summary payload. The exact
+    shape has not been observed with a non-empty cart, so this searches the
+    known Hybris key names and returns None rather than guessing."""
+    if isinstance(data, dict):
+        for key in TOTAL_KEYS:
+            if key in data:
+                v = data[key]
+                n = _num(v.get("value")) if isinstance(v, dict) else _num(v)
+                if n is not None:
+                    return n
+        for v in data.values():
+            if isinstance(v, (dict, list)):
+                n = extract_site_total(v)
+                if n is not None:
+                    return n
+    elif isinstance(data, list):
+        for v in data:
+            n = extract_site_total(v)
+            if n is not None:
+                return n
+    return None
+
+
+def classify_place_order(data: Any) -> Dict[str, Any]:
+    """/checkout/placeOrder JSON -> {"outcome": placed|three_ds_required|rejected|unknown, ...}."""
+    if isinstance(data, dict):
+        if data.get("success") and data.get("redirect"):
+            return {"outcome": "placed", "redirect": str(data["redirect"])}
+        link = data.get("otherCreditCard3DSLink") or data.get("directCreditCard3DSLink")
+        if link:
+            return {"outcome": "three_ds_required"}
+        if data.get("allocationTimeout"):
+            return {"outcome": "rejected", "code": "allocation_timeout"}
+    if isinstance(data, list) and data and isinstance(data[0], dict):
+        first = data[0]
+        return {"outcome": "rejected", "code": str(first.get("errorCode") or first.get("code") or first.get("type") or "unknown")}
+    return {"outcome": "unknown"}

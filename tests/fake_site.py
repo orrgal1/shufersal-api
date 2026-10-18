@@ -45,6 +45,14 @@ class FakeSite:
         self.fail_update = False       # update returns 200 but changes nothing
         self.minicart_error = False
         self.ignore_first_removals = 0
+        # Checkout behaviour (shapes partly assumed: see shufersal_parsers).
+        self.selected_slot = None
+        self.checkout_state = {"path": "/online/he/checkout/multi/summary", "reauth": False, "cvv": False,
+                               "threeDS": True, "threeDSTest": False}
+        self.cost_summary = None  # defaults to {"totalPrice": {"value": subtotal + fee}}
+        self.place_order_response = {"success": True, "redirect": "/checkout/orderConfirmation/123456789"}
+        self.confirmation_html = "<h1>תודה</h1><p>מספר הזמנה: 123456789</p>"
+        self.orders_placed = 0
 
     # ---- helpers ----
     def _render_cart(self):
@@ -113,6 +121,19 @@ class FakeSite:
             return 200, url, json.dumps(SLOTS)
         if path == "/online/he/checkout/payment/customer/paymentInfos":
             return 200, url, json.dumps(PAYMENT_INFOS)
+        if path == "/online/he/timeSlot/preselection/postHomeDeliverySlot" and method == "POST":
+            self.selected_slot = json.loads(body)["homeDeliveryTimeSlot"]["code"]
+            return 200, url, "{}"
+        if path == "/online/he/checkout/costSummary/direct":
+            if self.cost_summary is not None:
+                return 200, url, json.dumps(self.cost_summary)
+            subtotal = sum(CATALOG[e["code"]]["price"] * e["qty"] for e in self.cart)
+            fee = next((s["price"]["value"] for d in SLOTS.values() for s in d if s["code"] == self.selected_slot), 0)
+            return 200, url, json.dumps({"subTotal": {"value": round(subtotal, 2)}, "totalPrice": {"value": round(subtotal + fee, 2)}})
+        if path == "/online/he/checkout/placeOrder":
+            self.orders_placed += 1
+            self.place_order_query = q
+            return 200, url, json.dumps(self.place_order_response)
         if path == "/online/he/my-account":
             return 200, BASE + "/online/he/my-account/personal-area", "<html></html>"
         return 404, url, "not found"
@@ -141,9 +162,19 @@ class FakePage:
         self.gotos.append(url)
         self.url = url
 
+    async def wait_for_timeout(self, ms):
+        return None
+
+    async def content(self):
+        return self.site.confirmation_html if "order" in self.url.lower() else "<html></html>"
+
     async def evaluate(self, script, args=None):
         if self.closed:
             raise Exception("Target page, context or browser has been closed")
+        if args is None:  # checkout page state probe
+            return dict(self.site.checkout_state)
+        if isinstance(args, bool):  # PayMe.clientData(isTestMode)
+            return "payme-jwt"
         url, method, body, content_type = args
         status, final, text = self.site.handle(url, method, body, content_type)
         return {"status": status, "url": final, "text": text}
