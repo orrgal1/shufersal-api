@@ -436,8 +436,10 @@ def test_place_order_outcomes(live, client, site, armed, response, status, code)
     body = res.json()
     assert (body.get("status") or body["error"]["code"]) == code
     assert body.get("order_id") is None
-    # Whatever happened, the key cannot place a second order.
+    # Whatever happened, neither the key nor the quote can place a second order.
     client.post("/checkout/submit", json=req, headers={**AUTH, "Idempotency-Key": key})
+    other = client.post("/checkout/submit", json=req, headers={**AUTH, "Idempotency-Key": key + "-new"})
+    assert other.status_code == 409 and other.json()["error"]["code"] == "quote_consumed"
     assert site.orders_placed == 1
 
 

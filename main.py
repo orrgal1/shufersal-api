@@ -42,7 +42,7 @@ SAFE_CHECKOUT_CODES = {
     "total_drift", "quote_expired_or_invalid", "cart_mismatch", "cart_empty", "slot_unavailable",
     "checkout_blocked", "confirmation_required", "idempotency_key_required", "idempotency_key_used",
     "live_checkout_disabled", "order_rejected", "checkout_not_configured", "browser_unavailable",
-    "slot_select_failed", "checkout_unreachable", "payment_method_unavailable", "invalid_input",
+    "slot_select_failed", "checkout_unreachable", "quote_consumed", "cart_incomplete", "payment_method_unavailable", "invalid_input",
 }
 
 logging.basicConfig(
@@ -360,6 +360,9 @@ async def submit_checkout(
                 message="Checkout is not configured."
             )
         previous = checkout_ledger.claim(idempotency_key, payload.quote_id)
+        if previous is not None and previous["state"] == "quote_consumed":
+            raise APIException(status_code=409, code="quote_consumed",
+                               message="This quote already had a placement attempt. Get a new quote and check the cart.")
         if previous is not None:
             if previous["state"] in FINAL_SUBMIT_STATES and previous["result"]:
                 log_mutation("POST", "/checkout/submit", previous["http_status"], None, {"replayed": True})

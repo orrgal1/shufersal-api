@@ -3,6 +3,10 @@
 A key is claimed before the order is attempted and is never released, so a
 retry, a crash or a restart can never submit the same key twice. Failed
 attempts keep their key burned; the caller must use a new key.
+
+Each quote also allows only one real placement attempt: after any attempt
+(including outcome_unknown or a pending 3-D Secure challenge) a new key on the
+same quote is refused, so placing again needs a fresh quote and cart check.
 """
 import json
 import sqlite3
@@ -29,10 +33,13 @@ class CheckoutLedger:
                 " idempotency_key TEXT PRIMARY KEY, quote_id TEXT NOT NULL, state TEXT NOT NULL,"
                 " http_status INTEGER, result TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)"
             )
+            self._conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS one_attempt_per_quote ON submissions (quote_id)")
         return self._conn
 
     def claim(self, key: str, quote_id: str) -> Optional[Dict[str, Any]]:
-        """Claims the key. Returns None when newly claimed, else the existing record."""
+        """Claims the key for this quote. Returns None when newly claimed, the
+        existing record when the key was used before, or {"state": "quote_consumed"}
+        when another key already attempted this quote."""
         now = datetime.now(timezone.utc).isoformat()
         with self._lock:
             db = self._db()
@@ -42,7 +49,8 @@ class CheckoutLedger:
                     " VALUES (?, ?, 'in_progress', ?, ?)", (key, quote_id, now, now))
                 return None
             except sqlite3.IntegrityError:
-                return self.get(key)
+                existing = self.get(key)
+                return existing if existing else {"state": "quote_consumed", "quote_id": quote_id}
 
     def finish(self, key: str, state: str, http_status: int, result: Dict[str, Any]):
         now = datetime.now(timezone.utc).isoformat()

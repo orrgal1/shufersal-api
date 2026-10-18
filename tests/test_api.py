@@ -199,6 +199,11 @@ def test_checkout_quote_and_submit_drift_protection(monkeypatch):
     reuse = client.post("/checkout/submit", json=real, headers={**AUTH_HEADERS, "Idempotency-Key": "k3"})
     assert reuse.status_code == 409 and reuse.json()["error"]["code"] == "idempotency_key_used"
 
+    # The drift attempt consumed the quote: a new key on it is refused.
+    consumed = client.post("/checkout/submit", json=real, headers={**AUTH_HEADERS, "Idempotency-Key": "k3b"})
+    assert consumed.status_code == 409 and consumed.json()["error"]["code"] == "quote_consumed"
+    quote = client.post(f"/checkout/quote?delivery_slot_id={slot_id}", headers=AUTH_HEADERS).json()
+    real = {**real, "quote_id": quote["quote_id"]}
     ok = client.post("/checkout/submit", json=real, headers={**AUTH_HEADERS, "Idempotency-Key": "k4"})
     assert ok.status_code == 200, ok.text
     assert ok.json()["status"] == "placed" and ok.json()["order_id"].startswith("MOCK-")
