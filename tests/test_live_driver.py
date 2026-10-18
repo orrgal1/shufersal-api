@@ -363,7 +363,7 @@ def test_dry_run_walks_checkout_and_stops_before_placing(live, client, site):
 def test_quote_refuses_when_page_hides_lines(live, client, site):
     site.cart.append({"entry": 0, "code": "522319", "qty": 3.0})
     site.cart.append({"entry": 1, "code": "7296073746423", "qty": 1.0})
-    site.hidden_entries = {1}  # site counts 2 lines; the page shows 1 line of 3 units
+    site.hidden_entries = {1}  # site counts 4 units; the page shows 1 line of 3 units
     assert client.get("/cart", headers=AUTH).json()["lines_complete"] is False
     res = client.post("/checkout/quote?delivery_slot_id=148340770", headers=AUTH)
     assert res.status_code == 409 and res.json()["error"]["code"] == "cart_incomplete"
@@ -533,3 +533,11 @@ def test_site_total_reads_cart_level_key_only():
     assert extract_site_total({"entries": [{"totalPrice": {"value": 7.35}}], "subTotal": {"value": 50}}) is None
     assert extract_site_total({"totalPriceWithDelivery": {"value": 126.4}, "totalPrice": {"value": 90.5}}) == 126.4
     assert extract_site_total([{"totalPrice": 1}]) is None
+
+
+def test_completeness_uses_units_not_lines(live, client, site):
+    site.cart.append({"entry": 0, "code": "522319", "qty": 2.0})
+    assert client.get("/cart", headers=AUTH).json()["lines_complete"] is True  # count 2 == 2 units
+    original = site._minicart
+    site._minicart = lambda: original().replace('"miniCartCount": 2', '"miniCartCount": 1')  # a line count
+    assert client.get("/cart", headers=AUTH).json()["lines_complete"] is False

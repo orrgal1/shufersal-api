@@ -80,8 +80,10 @@ class FakeSite:
 
     def _minicart(self):
         total = sum(CATALOG[e["code"]]["price"] * e["qty"] for e in self.cart)
+        # Like the live site: the count is units (weighed lines count once).
+        units = sum(e["qty"] if CATALOG[e["code"]]["selling"] == "BY_UNIT" else 1 for e in self.cart)
         return ('\n\n{"miniCartCount": %d, "miniCartPrice": "<span>%.2f</span><span class="currency">'
-                '<span aria-hidden="true">₪</span></span>\n\t\t"}' % (len(self.cart), total))
+                '<span aria-hidden="true">₪</span></span>\n\t\t"}' % (round(units), total))
 
     def _renumber(self):
         for i, e in enumerate(self.cart):

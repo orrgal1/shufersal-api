@@ -426,10 +426,11 @@ class ShufersalDriver:
                 "unit_price_ils": unit,
                 "line_total_ils": round(unit * e["qty"], 2) if unit is not None else None,
             })
-        # The mini-cart count must agree with what the page showed (as lines or as
-        # units), otherwise the cart fingerprint could be missing hidden lines.
+        # miniCartCount is the site's own field and counts UNITS (verified live
+        # 2026-10-18: one line at qty 2 reads 2). Weighed lines are assumed to
+        # count once each. Any disagreement means the page hid lines.
         units = sum(i["qty"] if i["selling_method"] == "BY_UNIT" else 1 for i in items)
-        lines_complete = count == len(items) or abs(count - units) < QTY_TOLERANCE
+        lines_complete = abs(count - units) < QTY_TOLERANCE
         return {
             "items": items,
             "item_count": count,
