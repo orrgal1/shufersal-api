@@ -634,3 +634,20 @@ def test_watched_handover_ignores_non_confirmation_pages(live, client, site, arm
     site.confirm_on_url_reads = 0
     res = client.post("/checkout/submit", json=_real(q, watched=True), headers={**AUTH, "Idempotency-Key": "watch-nc"})
     assert res.json()["status"] == "handover_timeout" and res.json()["order_id"] is None
+
+
+def test_search_prices_come_from_the_search_json():
+    from shufersal_parsers import parse_search_results
+    data = {"results": [
+        {"code": "P_1", "name": "a", "price": {"value": 16.5}, "effectivePrice": {"value": 12.0}, "pricePerUnit": {"value": 0.18}},
+        {"code": "P_2", "name": "b", "price": None, "effectivePrice": {"value": 9.9}},
+        {"code": "P_3", "name": "c", "priceRange": {"minPrice": {"value": 4.5}}},
+        {"code": "P_4", "name": "d"},
+    ]}
+    got = {i["id"]: (i["price_ils"], i["sale_price_ils"], i["price_per_unit_ils"]) for i in parse_search_results(data)}
+    assert got == {"1": (16.5, 12.0, 0.18), "2": (9.9, None, None), "3": (4.5, None, None), "4": (None, None, None)}
+
+
+def test_search_api_returns_prices(live, client):
+    res = client.get("/search?q=522319", headers=AUTH).json()["results"]
+    assert res[0]["price_ils"] == 7.35 and res[0]["selling_method"] == "BY_UNIT"

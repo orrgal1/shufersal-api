@@ -17,7 +17,12 @@ class ProductSearchItem(BaseModel):
     id: str
     name: str
     brand: str
-    price_ils: float
+    # The site's shelf price; falls back to its effective/range price, and is
+    # null only when the site sends no price at all for the product.
+    price_ils: Optional[float] = None
+    sale_price_ils: Optional[float] = None
+    price_per_unit_ils: Optional[float] = None
+    selling_method: Optional[str] = None
     unit: str
     image_url: str
     in_stock: bool
@@ -29,7 +34,7 @@ class ProductDetailResponse(BaseModel):
     id: str
     name: str
     description: str
-    price_ils: float
+    price_ils: Optional[float] = None
     sale_price_ils: Optional[float] = None
     unit: str
     nutrition_url: Optional[str] = None

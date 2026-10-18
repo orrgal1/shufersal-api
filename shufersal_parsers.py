@@ -46,10 +46,12 @@ def parse_search_results(data: Any) -> List[Dict[str, Any]]:
     for r in data["results"]:
         code = clean_code(r.get("code"))
         name = (r.get("name") or "").strip()
-        price = _num((r.get("price") or {}).get("value"))
-        if not code or not name or price is None:
+        if not code or not name:
             continue
-        effective = _num((r.get("effectivePrice") or {}).get("value")) if isinstance(r.get("effectivePrice"), dict) else None
+        price = _money(r.get("price"))
+        effective = _money(r.get("effectivePrice"))
+        if price is None:  # fall back to other price fields the search JSON carries
+            price = effective if effective is not None else _money((r.get("priceRange") or {}).get("minPrice"))
         stock_code = (((r.get("stock") or {}).get("stockLevelStatus") or {}).get("code") or "").lower()
         images = r.get("images") or []
         image_url = next((i.get("url") for i in images if isinstance(i, dict) and i.get("url")), "") or ""
@@ -59,7 +61,8 @@ def parse_search_results(data: Any) -> List[Dict[str, Any]]:
             "name": name,
             "brand": (r.get("brandName") or "").strip() or "שופרסל",
             "price_ils": price,
-            "sale_price_ils": effective if effective is not None and effective < price else None,
+            "sale_price_ils": effective if effective is not None and price is not None and effective < price else None,
+            "price_per_unit_ils": _money(r.get("pricePerUnit")),
             "unit": (r.get("unitDescription") or "").strip() or "יחידה",
             "image_url": image_url,
             "in_stock": stock_code != "outofstock",
@@ -67,6 +70,10 @@ def parse_search_results(data: Any) -> List[Dict[str, Any]]:
             "description": (r.get("description") or name).strip() if isinstance(r.get("description"), str) else name,
         })
     return items
+
+
+def _money(v: Any) -> Optional[float]:
+    return _num(v.get("value")) if isinstance(v, dict) else _num(v)
 
 
 def find_exact(items: List[Dict[str, Any]], product_id: str) -> Optional[Dict[str, Any]]:
