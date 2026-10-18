@@ -525,3 +525,11 @@ def test_watched_dry_run_does_not_wait_or_place(live, client, site, watch_fast):
     res = client.post("/checkout/submit", json={**_real(q, watched=True), "dry_run": True, "confirm": False}, headers=AUTH)
     assert res.status_code == 200 and res.json()["status"] == "dry_run"
     assert site.orders_placed == 0
+
+
+def test_site_total_reads_cart_level_key_only():
+    from shufersal_parsers import extract_site_total
+    assert extract_site_total({"totalPrice": {"value": 90.5}, "entries": [{"totalPrice": {"value": 7.35}}]}) == 90.5
+    assert extract_site_total({"entries": [{"totalPrice": {"value": 7.35}}], "subTotal": {"value": 50}}) is None
+    assert extract_site_total({"totalPriceWithDelivery": {"value": 126.4}, "totalPrice": {"value": 90.5}}) == 126.4
+    assert extract_site_total([{"totalPrice": 1}]) is None

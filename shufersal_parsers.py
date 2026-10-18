@@ -246,28 +246,20 @@ def parse_order_number(url: str, html: str) -> Optional[str]:
 
 # ==================== Checkout ====================
 
-TOTAL_KEYS = ("totalPriceWithDelivery", "totalPriceWithTax", "totalPrice", "total")
+TOTAL_KEYS = ("totalPriceWithDelivery", "totalPriceWithTax", "totalPrice")
 
 
 def extract_site_total(data: Any) -> Optional[float]:
-    """Finds the order total in a checkout cost-summary payload. The exact
-    shape has not been observed with a non-empty cart, so this searches the
-    known Hybris key names and returns None rather than guessing."""
-    if isinstance(data, dict):
-        for key in TOTAL_KEYS:
-            if key in data:
-                v = data[key]
-                n = _num(v.get("value")) if isinstance(v, dict) else _num(v)
-                if n is not None:
-                    return n
-        for v in data.values():
-            if isinstance(v, (dict, list)):
-                n = extract_site_total(v)
-                if n is not None:
-                    return n
-    elif isinstance(data, list):
-        for v in data:
-            n = extract_site_total(v)
+    """Cart-level order total from a checkout cost-summary payload. Only the
+    top-level keys are read, so a line or sub-cart "totalPrice" nested deeper
+    can never be mistaken for the order total. The exact shape has not been
+    observed with a non-empty cart; None means "not found", never a guess."""
+    if not isinstance(data, dict):
+        return None
+    for key in TOTAL_KEYS:
+        if key in data:
+            v = data[key]
+            n = _num(v.get("value")) if isinstance(v, dict) else _num(v)
             if n is not None:
                 return n
     return None
