@@ -1,5 +1,5 @@
 from typing import Optional, List, Any, Dict
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 class ErrorDetail(BaseModel):
     code: str
@@ -113,9 +113,10 @@ class CheckoutQuoteResponse(BaseModel):
     expires_at: str
 
 class CheckoutSubmitRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     quote_id: str
     confirm_total_ils: float
-    cvv: Optional[str] = None
 
 class CheckoutSubmitResponse(BaseModel):
     order_id: str

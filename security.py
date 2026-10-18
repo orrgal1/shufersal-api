@@ -8,6 +8,7 @@ from fastapi.security.utils import get_authorization_scheme_param
 import jwt
 
 import config
+from local_api_core.auth import verify_bearer_token as verify_static_bearer
 
 CARD_REGEX = re.compile(r'\b(?:\d[ -]*?){13,19}\b')
 CVV_REGEX = re.compile(r'(?i)(cvv|cvc|cvn|security_code)[\s:=]+["\']?(\d{3,4})["\']?')
@@ -123,7 +124,7 @@ async def verify_bearer_token(request: Request) -> Dict[str, Any]:
         pass
 
     # 2. Fallback to static token if configured
-    if config.SHUFERSAL_API_TOKEN and token == config.SHUFERSAL_API_TOKEN:
+    if verify_static_bearer(auth_header, config.SHUFERSAL_API_TOKEN):
         return {"sub": "static-token"}
 
     raise APIException(

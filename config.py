@@ -6,7 +6,10 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # Authentication token (static fallback)
-SHUFERSAL_API_TOKEN = os.getenv("SHUFERSAL_API_TOKEN", "")
+SHUFERSAL_API_TOKEN = os.getenv("SHUFERSAL_API_TOKEN", "") or (
+    Path(".api_token").read_text(encoding="utf-8").strip()
+    if Path(".api_token").exists() else ""
+)
 
 # JWT Secret & Algorithm
 JWT_SECRET = os.getenv("JWT_SECRET")
@@ -38,3 +41,6 @@ MOCK_MODE = os.getenv("MOCK_MODE", "false").strip().lower() in ("true", "1", "ye
 
 # Base URL for Shufersal
 SHUFERSAL_BASE_URL = os.getenv("SHUFERSAL_BASE_URL", "https://www.shufersal.co.il")
+
+# Loaded from the local .env at service startup. Never accept it from API callers.
+SHUFERSAL_CVV = os.getenv("SHUFERSAL_CVV", "")

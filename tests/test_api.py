@@ -1,12 +1,17 @@
 import pytest
 import os
+import stat
+from unittest.mock import AsyncMock
 
 os.environ["SHUFERSAL_API_TOKEN"] = "test-secret-token-xyz-123"
 os.environ["JWT_SECRET"] = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 os.environ["MOCK_MODE"] = "true"
 
 from fastapi.testclient import TestClient
+import main as main_module
+import config
 from main import app
+from setup_checkout_cvv import set_local_cvv
 from security import generate_jwt_token, sanitize_log_message
 from idempotency import idempotency_store, quote_store
 from shufersal_driver import shufersal_driver
@@ -138,8 +143,8 @@ def test_delivery_and_payment():
     assert "cvv" not in pay_data
     assert len(pay_data["last4"]) == 4
 
-def test_checkout_quote_and_submit_drift_protection():
-    """Verify quote generation and total drift / CVV protections on checkout submit."""
+def test_checkout_quote_and_submit_drift_protection(monkeypatch):
+    """Verify checkout uses only local CVV and keeps drift/idempotency guards."""
     client.delete("/cart", headers=AUTH_HEADERS)
     add_res = client.post("/cart/items", json={"product_id": "P12345", "qty": 1.0}, headers=AUTH_HEADERS)
     cart = add_res.json()
@@ -153,45 +158,86 @@ def test_checkout_quote_and_submit_drift_protection():
     quote_id = quote["quote_id"]
     correct_total = quote["total_ils"]
 
-    # Drift -> 409
+    original_submit_order = shufersal_driver.submit_order
+    submit_order = AsyncMock(
+        return_value={"order_id": "MOCK-ORDER", "eta": "soon", "total_ils": correct_total,
+                      "cvv": "042"}
+    )
+    monkeypatch.setattr(shufersal_driver, "submit_order", submit_order)
+
+    # Local checkout configuration must fail closed before the driver is called.
+    monkeypatch.setattr(config, "SHUFERSAL_CVV", "")
+    missing_res = client.post(
+        "/checkout/submit",
+        json={
+            "quote_id": quote_id,
+            "confirm_total_ils": correct_total,
+        },
+        headers=AUTH_HEADERS,
+    )
+    assert missing_res.status_code == 503
+    assert missing_res.json()["error"]["code"] == "checkout_not_configured"
+    assert submit_order.await_count == 0
+
+    monkeypatch.setattr(config, "SHUFERSAL_CVV", "042")
+    # Caller supplied payment secrets are rejected without reflecting them.
+    bad_res = client.post(
+        "/checkout/submit",
+        json={"quote_id": quote_id, "confirm_total_ils": correct_total, "cvv": "123"},
+        headers=AUTH_HEADERS,
+    )
+    assert bad_res.status_code == 400
+    assert "123" not in bad_res.text
+    assert submit_order.await_count == 0
+
+    # Drift -> 409 before order placement.
+    monkeypatch.setattr(shufersal_driver, "submit_order", original_submit_order)
     drift_res = client.post(
         "/checkout/submit",
         json={
             "quote_id": quote_id,
             "confirm_total_ils": correct_total + 10.0,
-            "cvv": "123"
         },
         headers=AUTH_HEADERS
     )
     assert drift_res.status_code == 409
     assert drift_res.json()["error"]["code"] == "total_drift"
 
-    # Missing CVV -> 400
-    no_cvv_res = client.post(
-        "/checkout/submit",
-        json={
-            "quote_id": quote_id,
-            "confirm_total_ils": correct_total
-        },
-        headers=AUTH_HEADERS
-    )
-    assert no_cvv_res.status_code == 400
-    assert no_cvv_res.json()["error"]["code"] == "cvv_required"
-
-    # Success
+    monkeypatch.setattr(shufersal_driver, "submit_order", submit_order)
     success_res = client.post(
         "/checkout/submit",
         json={
             "quote_id": quote_id,
             "confirm_total_ils": correct_total,
-            "cvv": "123"
         },
-        headers=AUTH_HEADERS
+        headers={**AUTH_HEADERS, "Idempotency-Key": "checkout-test-secret-filter"}
     )
     assert success_res.status_code == 200
     submit_data = success_res.json()
-    assert "order_id" in submit_data
+    assert submit_data["order_id"] == "MOCK-ORDER"
     assert submit_data["total_ils"] == correct_total
+    assert "042" not in success_res.text
+    assert submit_order.await_args.kwargs["cvv"] == "042"
+    cached_res = client.post(
+        "/checkout/submit",
+        json={"quote_id": quote_id, "confirm_total_ils": correct_total},
+        headers={**AUTH_HEADERS, "Idempotency-Key": "checkout-test-secret-filter"},
+    )
+    assert cached_res.status_code == 200
+    assert "042" not in cached_res.text
+    assert submit_order.await_count == 1
+
+
+def test_setup_checkout_cvv_file_is_private_and_preserves_settings(tmp_path):
+    env_file = tmp_path / ".env"
+    env_file.write_text("HOST=127.0.0.1\nSHUFERSAL_CVV=999\nPORT=8000\n", encoding="utf-8")
+    os.chmod(env_file, 0o644)
+    set_local_cvv("042", env_file)
+    assert env_file.read_text(encoding="utf-8") == "HOST=127.0.0.1\nSHUFERSAL_CVV=042\nPORT=8000\n"
+    assert stat.S_IMODE(env_file.stat().st_mode) == 0o600
+    with pytest.raises(ValueError):
+        set_local_cvv("12x", env_file)
+    assert "SHUFERSAL_CVV=042" in env_file.read_text(encoding="utf-8")
 
 def test_sensitive_log_sanitizer():
     """Verify regex redacts credit card numbers, CVVs, and JWT signatures."""

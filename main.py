@@ -61,24 +61,34 @@ app = FastAPI(
 
 @app.exception_handler(APIException)
 async def api_exception_handler(request: Request, exc: APIException):
+    message = exc.message
+    if request.url.path == "/checkout/submit":
+        # Driver errors must not be able to reflect a caller's payment secret.
+        message = {
+            "total_drift": "The live total differs from the confirmed quote.",
+            "quote_expired_or_invalid": "Quote is invalid or expired.",
+        }.get(exc.code, "Checkout could not be completed.")
     return JSONResponse(
         status_code=exc.status_code,
-        content={"error": {"code": exc.code, "message": exc.message}}
+        content={"error": {"code": exc.code, "message": message}}
     )
 
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request: Request, exc: RequestValidationError):
     return JSONResponse(
         status_code=status.HTTP_400_BAD_REQUEST,
-        content={"error": {"code": "invalid_input", "message": str(exc)}}
+        content={"error": {"code": "invalid_input", "message": "Request fields are invalid."}}
     )
 
 @app.exception_handler(Exception)
 async def generic_exception_handler(request: Request, exc: Exception):
-    logger.error(f"Unhandled server error on {request.url.path}: {exc}", exc_info=True)
+    if request.url.path == "/checkout/submit":
+        logger.error("Unhandled checkout submission error")
+    else:
+        logger.error(f"Unhandled server error on {request.url.path}: {exc}", exc_info=True)
     return JSONResponse(
         status_code=status.HTTP_502_BAD_GATEWAY,
-        content={"error": {"code": "upstream_error", "message": f"Service encountered an error: {str(exc)}"}}
+        content={"error": {"code": "upstream_error", "message": "The upstream service failed."}}
     )
 
 # ==================== Endpoints ====================
@@ -296,13 +306,13 @@ async def submit_checkout(
     idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key")
 ):
     """
-    POST /checkout/submit body:{quote_id, confirm_total_ils, cvv(optional)}
+    POST /checkout/submit body:{quote_id, confirm_total_ils}
     Places order ONLY if confirm_total_ils == live re-read site total and quote not expired -> {order_id, eta, total_ils}. Otherwise 409.
     """
     if idempotency_key:
         cached = idempotency_store.get(idempotency_key)
         if cached:
-            log_mutation("POST", "/checkout/submit", cached["status_code"], idempotency_key, {"cached": True})
+            log_mutation("POST", "/checkout/submit", cached["status_code"], None, {"cached": True})
             return JSONResponse(status_code=cached["status_code"], content=cached["body"])
 
     # 1. Retrieve quote & check expiration
@@ -314,25 +324,36 @@ async def submit_checkout(
             message=f"Quote {payload.quote_id} not found or has expired"
         )
 
+    # The payment secret is local to this service. Fail before touching the driver
+    # if it has not been configured or is malformed.
+    cvv = config.SHUFERSAL_CVV
+    if not (len(cvv) in (3, 4) and cvv.isascii() and cvv.isdecimal()):
+        raise APIException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            code="checkout_not_configured",
+            message="Checkout is not configured."
+        )
+
     # 2. Check total drift against live re-read total
     result = await shufersal_driver.submit_order(
         quote_id=payload.quote_id,
         confirm_total_ils=payload.confirm_total_ils,
         live_quote=quote,
-        cvv=payload.cvv
+        cvv=cvv
     )
 
+    response = CheckoutSubmitResponse(**result)
     if idempotency_key:
-        idempotency_store.set(idempotency_key, 200, result)
+        idempotency_store.set(idempotency_key, 200, response.model_dump())
 
     log_mutation(
         "POST",
         "/checkout/submit",
         200,
-        idempotency_key,
-        {"quote_id": payload.quote_id, "order_id": result["order_id"]}
+        None,
+        {}
     )
-    return CheckoutSubmitResponse(**result)
+    return response
 # ==================== Feedback ====================
 
 @app.post("/feedback", response_model=FeedbackResponse)
