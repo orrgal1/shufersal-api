@@ -172,22 +172,79 @@ def test_add_ignored_by_site_is_an_error(live, client, site):
 def test_update_ignored_by_site_is_an_error(live, client, site):
     client.post("/cart/items", json={"product_id": "522319", "qty": 1}, headers=AUTH)
     site.fail_update = True
-    res = client.patch("/cart/items/0", json={"qty": 5}, headers=AUTH)
+    res = client.patch("/cart/items/0", json={"qty": 5, "product_code": "522319"}, headers=AUTH)
     assert res.status_code == 502
     assert res.json()["error"]["code"] == "cart_write_unverified"
 
 
-def test_update_and_delete_need_exact_line_id(live, client, site):
+def test_update_and_delete_require_product_code(live, client, site):
     client.post("/cart/items", json={"product_id": "522319", "qty": 1}, headers=AUTH)
     before = len(write_requests(site))
-    for line in ("1", "522319", "5", "00", "P_522319"):
-        assert client.patch(f"/cart/items/{line}", json={"qty": 3}, headers=AUTH).status_code == 404, line
-        assert client.delete(f"/cart/items/{line}", headers=AUTH).status_code == 404, line
+    assert client.patch("/cart/items/0", json={"qty": 3}, headers=AUTH).json()["error"]["code"] == "product_code_required"
+    assert client.delete("/cart/items/0", headers=AUTH).json()["error"]["code"] == "product_code_required"
+    # A code that is not in the cart never touches another line, whatever the line id.
+    assert client.patch("/cart/items/0", json={"qty": 3, "product_code": "52231"}, headers=AUTH).status_code == 404
+    assert client.delete("/cart/items/0?product_code=4131074", headers=AUTH).status_code == 200
     assert len(write_requests(site)) == before
-    res = client.patch("/cart/items/0", json={"qty": 3}, headers=AUTH)
+    res = client.patch("/cart/items/0", json={"qty": 3, "product_code": "P_522319"}, headers=AUTH)
     assert res.status_code == 200 and res.json()["items"][0]["qty"] == 3.0
-    res = client.delete("/cart/items/0", headers=AUTH)
+    res = client.delete("/cart/items/0?product_code=522319", headers=AUTH)
     assert res.status_code == 200 and res.json()["items"] == []
+
+
+def test_stale_line_ids_after_renumbering_hit_the_right_product(live, client, site):
+    for code in ("522319", "7296073746423", "4131074"):  # lines 0, 1, 2
+        site.cart.append({"entry": len(site.cart), "code": code, "qty": 1.0})
+    # Delete A (line 0); the site renumbers: B becomes 0, C becomes 1.
+    assert client.delete("/cart/items/0?product_code=522319", headers=AUTH).status_code == 200
+    # Delete B with its stale id (1, which now points at C).
+    res = client.delete("/cart/items/1?product_code=7296073746423", headers=AUTH)
+    assert res.status_code == 200, res.text
+    assert [e["code"] for e in site.cart] == ["4131074"]
+    # Update C with its stale id (2, which no longer exists).
+    res = client.patch("/cart/items/2", json={"qty": 4, "product_code": "4131074"}, headers=AUTH)
+    assert res.status_code == 200 and site.cart == [{"entry": 0, "code": "4131074", "qty": 4.0}]
+
+
+def test_retry_after_uncertain_add_reconciles_instead_of_adding_twice(live, client, site):
+    site.fail_reads_after_write = 1  # the add lands, but the verification read fails
+    hdr = {**AUTH, "Idempotency-Key": "add-uncertain-1"}
+    first = client.post("/cart/items", json={"product_id": "522319", "qty": 2}, headers=hdr)
+    assert first.status_code == 502
+    assert site.cart == [{"entry": 0, "code": "522319", "qty": 2.0}]
+    retry = client.post("/cart/items", json={"product_id": "522319", "qty": 2}, headers=hdr)
+    assert retry.status_code == 200, retry.text
+    assert site.cart == [{"entry": 0, "code": "522319", "qty": 2.0}]  # not 4
+    assert len([r for r in site.requests if r[1] == "/online/he/cart/add"]) == 1
+
+
+def test_retry_after_failed_add_writes_once(live, client, site):
+    hdr = {**AUTH, "Idempotency-Key": "add-failed-1"}
+    site.fail_add = True
+    assert client.post("/cart/items", json={"product_id": "522319", "qty": 1}, headers=hdr).status_code == 502
+    site.fail_add = False
+    res = client.post("/cart/items", json={"product_id": "522319", "qty": 1}, headers=hdr)
+    assert res.status_code == 200 and site.cart[0]["qty"] == 1.0
+
+
+def test_retry_refuses_when_cart_moved_on(live, client, site):
+    site.fail_reads_after_write = 1
+    hdr = {**AUTH, "Idempotency-Key": "add-moved-1"}
+    client.post("/cart/items", json={"product_id": "522319", "qty": 2}, headers=hdr)
+    site.cart[0]["qty"] = 5.0  # someone changed it in between
+    res = client.post("/cart/items", json={"product_id": "522319", "qty": 2}, headers=hdr)
+    assert res.status_code == 409 and res.json()["error"]["code"] == "cart_state_changed"
+    assert site.cart[0]["qty"] == 5.0
+
+
+def test_batch_retry_reconciles(live, client, site):
+    site.fail_reads_after_write = 1
+    hdr = {**AUTH, "Idempotency-Key": "batch-1"}
+    body = {"items": [{"product_id": "522319", "qty": 2}, {"product_id": "4131074", "qty": 1}], "clear_first": False}
+    client.post("/cart/batch", json=body, headers=hdr)
+    res = client.post("/cart/batch", json=body, headers=hdr)
+    assert res.status_code == 200, res.text
+    assert sorted((e["code"], e["qty"]) for e in site.cart) == [("4131074", 1.0), ("522319", 2.0)]
 
 
 def test_clear_loops_until_site_cart_is_empty(live, client, site):
@@ -301,6 +358,15 @@ def test_dry_run_walks_checkout_and_stops_before_placing(live, client, site):
     assert site.orders_placed == 0
     assert site.cart == cart_before  # never modifies the cart
     assert not [r for r in site.requests if r[1].startswith("/online/he/cart/") and r[0] == "POST"]
+
+
+def test_quote_refuses_when_page_hides_lines(live, client, site):
+    site.cart.append({"entry": 0, "code": "522319", "qty": 3.0})
+    site.cart.append({"entry": 1, "code": "7296073746423", "qty": 1.0})
+    site.hidden_entries = {1}  # site counts 2 lines; the page shows 1 line of 3 units
+    assert client.get("/cart", headers=AUTH).json()["lines_complete"] is False
+    res = client.post("/checkout/quote?delivery_slot_id=148340770", headers=AUTH)
+    assert res.status_code == 409 and res.json()["error"]["code"] == "cart_incomplete"
 
 
 def test_dry_run_reports_blockers(live, client, site):

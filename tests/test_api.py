@@ -116,14 +116,14 @@ def test_cart_lifecycle_and_idempotency():
     # 4. Update item quantity
     update_res = client.patch(
         f"/cart/items/{line_id}",
-        json={"qty": 4.0},
+        json={"qty": 4.0, "product_code": "P12345"},
         headers=AUTH_HEADERS
     )
     assert update_res.status_code == 200
     assert update_res.json()["items"][0]["qty"] == 4.0
 
     # 5. Delete item
-    del_res = client.delete(f"/cart/items/{line_id}", headers=AUTH_HEADERS)
+    del_res = client.delete(f"/cart/items/{line_id}?product_code=P12345", headers=AUTH_HEADERS)
     assert del_res.status_code == 200
     assert len(del_res.json()["items"]) == 0
 

@@ -53,6 +53,8 @@ class FakeSite:
         self.place_order_response = {"success": True, "redirect": "/checkout/orderConfirmation/123456789"}
         self.confirmation_html = "<h1>תודה</h1><p>מספר הזמנה: 123456789</p>"
         self.orders_placed = 0
+        self.fail_reads_after_write = 0  # the next N cart reads after a write fail (uncertain outcome)
+        self.hidden_entries = set()      # entry numbers the cart page does not render
 
     # ---- helpers ----
     def _render_cart(self):
@@ -60,6 +62,8 @@ class FakeSite:
                  'data-product-name="recommendation"><input name="qty" value="1"></li>']
         rows = []
         for e in self.cart:
+            if e["entry"] in self.hidden_entries:
+                continue
             p = CATALOG[e["code"]]
             rows.append(
                 f'<div class="miglog-prod miglog-sellingmethod-{p["selling"].lower()}" data-entry-number="{e["entry"]}" '
@@ -93,6 +97,9 @@ class FakeSite:
                         "stock": {"stockLevelStatus": {"code": "inStock"}}} for c in hits]
             return 200, url, json.dumps({"results": results})
         if path == "/online/he/cart/miniCart/TOTAL":
+            if self.fail_reads_after_write > 0 and any(r[0] == "POST" for r in self.requests):
+                self.fail_reads_after_write -= 1
+                return 500, url, "error"
             if self.minicart_error:
                 return 500, url, "error"
             return 200, url, self._minicart()

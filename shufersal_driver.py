@@ -424,9 +424,14 @@ class ShufersalDriver:
                 "unit_price_ils": unit,
                 "line_total_ils": round(unit * e["qty"], 2) if unit is not None else None,
             })
+        # The mini-cart count must agree with what the page showed (as lines or as
+        # units), otherwise the cart fingerprint could be missing hidden lines.
+        units = sum(i["qty"] if i["selling_method"] == "BY_UNIT" else 1 for i in items)
+        lines_complete = count == len(items) or abs(count - units) < QTY_TOLERANCE
         return {
             "items": items,
             "item_count": count,
+            "lines_complete": lines_complete,
             "subtotal_ils": round(subtotal, 2),
             # The fee depends on the chosen slot; see /delivery/slots and the checkout quote.
             "delivery_fee_ils": None,
@@ -498,76 +503,159 @@ class ShufersalDriver:
             return self._calculate_mock_cart()
         return await self._read_cart()
 
-    async def add_to_cart(self, product_id: str, qty: float = 1.0) -> Dict[str, Any]:
-        async with self._lock:
-            return await self._add_to_cart_unlocked(product_id, qty)
+    # ---- primitives (mock or live) ----
 
-    async def _add_to_cart_unlocked(self, product_id: str, qty: float = 1.0) -> Dict[str, Any]:
+    async def _resolve_product(self, product_id: str) -> Dict[str, Any]:
         if config.MOCK_MODE:
-            prod = self._mock_product(product_id)
-            line_id = f"line_{len(self._mock_cart) + 101}"
-            self._mock_cart.append({
-                "line_id": line_id, "product_id": product_id, "name": prod["name"], "qty": qty,
-                "unit_price_ils": prod["price_ils"], "line_total_ils": round(qty * prod["price_ils"], 2),
-            })
-            return self._calculate_mock_cart()
-
+            p = self._mock_product(product_id)
+            return {"id": product_id, "name": p["name"], "price_ils": p["price_ils"], "selling_method": "BY_UNIT"}
         product = await self._lookup_product(product_id)
         if not product:
             raise APIException(status_code=404, code="product_not_found",
                                message=f"No product with code {clean_code(product_id)} exists on the site.")
-        before = await self._read_cart()
-        existing = self._line_for(before, product["id"])
-        if existing:
-            target = round(existing["qty"] + qty, 3)
-            await self._post_update(existing["line_id"], target, existing["selling_method"])
-        else:
-            target = qty
-            await self._post_add(product, qty)
-        after = await self._read_cart()
-        self._verify_qty(after, product["id"], target, "Add to cart")
-        return after
+        return product
 
-    async def update_cart_item(self, line_id: str, qty: float) -> Dict[str, Any]:
-        async with self._lock:
-            return await self._update_cart_item_unlocked(line_id, qty)
-
-    async def _update_cart_item_unlocked(self, line_id: str, qty: float) -> Dict[str, Any]:
+    async def _write_qty(self, entry: Dict[str, Any], qty: float):
         if config.MOCK_MODE:
+            line = next(i for i in self._mock_cart if i["line_id"] == entry["line_id"])
             if qty <= 0:
-                return await self._delete_cart_item_unlocked(line_id)
-            existing = next((item for item in self._mock_cart if item["line_id"] == line_id), None)
-            if not existing:
-                raise APIException(status_code=404, code="item_not_found", message=f"Cart item {line_id} not found")
-            existing["qty"] = qty
-            existing["line_total_ils"] = round(qty * existing["unit_price_ils"], 2)
-            return self._calculate_mock_cart()
-
-        if qty <= 0:
-            return await self._delete_cart_item_unlocked(line_id)
-        before = await self._read_cart()
-        entry = self._entry(before, line_id)
+                self._mock_cart.remove(line)
+            else:
+                line["qty"] = qty
+                line["line_total_ils"] = round(qty * line["unit_price_ils"], 2)
+            return
         await self._post_update(entry["line_id"], qty, entry["selling_method"])
-        after = await self._read_cart()
+
+    async def _write_add(self, product: Dict[str, Any], qty: float):
+        if config.MOCK_MODE:
+            n = max([int(i["line_id"].split("_")[-1]) for i in self._mock_cart if i["line_id"].split("_")[-1].isdigit()] or [100]) + 1
+            self._mock_cart.append({"line_id": f"line_{n}", "product_id": product["id"], "name": product["name"],
+                                    "qty": qty, "unit_price_ils": product["price_ils"],
+                                    "line_total_ils": round(qty * product["price_ils"], 2)})
+            return
+        await self._post_add(product, qty)
+
+    @staticmethod
+    def _resolve_line(cart: Dict[str, Any], line_id: str, product_code: Optional[str]) -> Optional[Dict[str, Any]]:
+        """Maps (line_id, product_code) to the current cart line. The site
+        renumbers lines after a removal, so the product code is authoritative:
+        a stale line_id that now points at another product is re-resolved by
+        code. Returns None when the product is not in the cart."""
+        if not product_code:
+            raise APIException(status_code=400, code="product_code_required",
+                               message="Pass product_code with the line_id; line ids shift when lines are removed.")
+        code = clean_code(product_code)
+        entry = next((i for i in cart["items"] if i["line_id"] == str(line_id)), None)
+        if entry and clean_code(entry["product_id"]) == code:
+            return entry
+        matches = [i for i in cart["items"] if clean_code(i["product_id"]) == code]
+        if len(matches) > 1:
+            raise APIException(status_code=409, code="line_ambiguous",
+                               message=f"Product {code} appears on several cart lines; GET /cart and use the current line_id.")
+        return matches[0] if matches else None
+
+    @staticmethod
+    def _qty_of(cart: Dict[str, Any], code: str) -> float:
+        line = ShufersalDriver._line_for(cart, code)
+        return line["qty"] if line else 0.0
+
+    # ---- adds (planned, so retries reconcile instead of adding twice) ----
+
+    async def add_items(self, items: List[Tuple[str, float]], clear_first: bool = False,
+                        plan: Optional[Dict[str, Any]] = None, on_plan=None) -> Dict[str, Any]:
+        """Adds quantities to the cart. The target state is planned first and
+        handed to on_plan (the API records it under the Idempotency-Key)
+        before any write. Re-applying a recorded plan reconciles: lines already
+        at target are left alone, lines still at their planned starting
+        quantity are written, and anything else is a 409."""
+        async with self._lock:
+            if plan is None:
+                plan = await self._plan_add(items, clear_first)
+                if on_plan:
+                    on_plan(plan)
+            return await self._apply_plan(plan)
+
+    async def add_to_cart(self, product_id: str, qty: float = 1.0) -> Dict[str, Any]:
+        return await self.add_items([(product_id, qty)])
+
+    async def _plan_add(self, items: List[Tuple[str, float]], clear_first: bool) -> Dict[str, Any]:
+        products = {}
+        order = []
+        for pid, qty in items:
+            p = await self._resolve_product(pid)
+            if p["id"] not in products:
+                products[p["id"]] = {"product": {k: p.get(k) for k in ("id", "name", "price_ils", "selling_method")},
+                                     "add": 0.0}
+                order.append(p["id"])
+            products[p["id"]]["add"] += float(qty)
+        cart = await self._get_cart_unlocked()
+        plan_items = []
+        for code in order:
+            before = 0.0 if clear_first else self._qty_of(cart, code)
+            plan_items.append({"product": products[code]["product"], "before": before,
+                               "target": round(before + products[code]["add"], 3)})
+        return {"clear_first": bool(clear_first), "items": plan_items}
+
+    async def _apply_plan(self, plan: Dict[str, Any]) -> Dict[str, Any]:
+        cart = await self._get_cart_unlocked()
+        targets = {i["product"]["id"]: i["target"] for i in plan["items"]}
+        if plan["clear_first"]:
+            exact = ({clean_code(i["product_id"]) for i in cart["items"]} == {clean_code(c) for c in targets}
+                     and all(abs(self._qty_of(cart, c) - t) <= QTY_TOLERANCE for c, t in targets.items()))
+            if exact:
+                return cart
+            cart = await self._clear_cart_unlocked()
+        for item in plan["items"]:
+            code, before, target = item["product"]["id"], item["before"], item["target"]
+            current = self._qty_of(cart, code)
+            if abs(current - target) <= QTY_TOLERANCE:
+                continue
+            if abs(current - before) > QTY_TOLERANCE:
+                raise APIException(
+                    status_code=409, code="cart_state_changed",
+                    message=f"Product {clean_code(code)} is at quantity {current}; this request expected {before} "
+                            f"(or {target} once applied). GET /cart and decide before retrying.")
+            line = self._line_for(cart, code)
+            if line:
+                await self._write_qty(line, target)
+            else:
+                await self._write_add(item["product"], target)
+            cart = await self._get_cart_unlocked()
+        for code, target in targets.items():
+            self._verify_qty(cart, code, target, "Add to cart")
+        return cart
+
+    # ---- updates and removals (product code is authoritative) ----
+
+    async def update_cart_item(self, line_id: str, qty: float, product_code: Optional[str] = None) -> Dict[str, Any]:
+        async with self._lock:
+            return await self._update_cart_item_unlocked(line_id, qty, product_code)
+
+    async def _update_cart_item_unlocked(self, line_id: str, qty: float, product_code: Optional[str]) -> Dict[str, Any]:
+        if qty <= 0:
+            return await self._delete_cart_item_unlocked(line_id, product_code)
+        cart = await self._get_cart_unlocked()
+        entry = self._resolve_line(cart, line_id, product_code)
+        if entry is None:
+            raise APIException(status_code=404, code="item_not_found",
+                               message=f"Product {clean_code(product_code)} is not in the cart.")
+        if abs(entry["qty"] - qty) > QTY_TOLERANCE:
+            await self._write_qty(entry, qty)
+        after = await self._get_cart_unlocked()
         self._verify_qty(after, entry["product_id"], qty, "Quantity update")
         return after
 
-    async def delete_cart_item(self, line_id: str) -> Dict[str, Any]:
+    async def delete_cart_item(self, line_id: str, product_code: Optional[str] = None) -> Dict[str, Any]:
         async with self._lock:
-            return await self._delete_cart_item_unlocked(line_id)
+            return await self._delete_cart_item_unlocked(line_id, product_code)
 
-    async def _delete_cart_item_unlocked(self, line_id: str) -> Dict[str, Any]:
-        if config.MOCK_MODE:
-            orig_len = len(self._mock_cart)
-            self._mock_cart = [item for item in self._mock_cart if item["line_id"] != line_id]
-            if len(self._mock_cart) == orig_len:
-                raise APIException(status_code=404, code="item_not_found", message=f"Cart item {line_id} not found")
-            return self._calculate_mock_cart()
-
-        before = await self._read_cart()
-        entry = self._entry(before, line_id)
-        await self._post_update(entry["line_id"], 0, entry["selling_method"])
-        after = await self._read_cart()
+    async def _delete_cart_item_unlocked(self, line_id: str, product_code: Optional[str]) -> Dict[str, Any]:
+        cart = await self._get_cart_unlocked()
+        entry = self._resolve_line(cart, line_id, product_code)
+        if entry is None:
+            return cart  # already absent: removal is idempotent
+        await self._write_qty(entry, 0)
+        after = await self._get_cart_unlocked()
         self._verify_qty(after, entry["product_id"], 0.0, "Remove from cart")
         return after
 
@@ -576,19 +664,15 @@ class ShufersalDriver:
             return await self._clear_cart_unlocked()
 
     async def _clear_cart_unlocked(self) -> Dict[str, Any]:
-        if config.MOCK_MODE:
-            self._mock_cart.clear()
-            return self._calculate_mock_cart()
-
-        cart = await self._read_cart()
+        cart = await self._get_cart_unlocked()
         passes = len(cart["items"]) + 2
         for _ in range(passes):
-            if not cart["items"] and cart["item_count"] == 0:
+            if not cart["items"] and not cart["item_count"]:
                 return cart
-            # Highest entry number first so remaining entry numbers stay valid.
+            # Highest entry number first so the remaining entry numbers stay valid.
             for entry in sorted(cart["items"], key=lambda i: int(i["line_id"]) if i["line_id"].isdigit() else 0, reverse=True):
-                await self._post_update(entry["line_id"], 0, entry["selling_method"])
-            cart = await self._read_cart()
+                await self._write_qty(entry, 0)
+            cart = await self._get_cart_unlocked()
         if cart["items"] or cart["item_count"]:
             raise _upstream(f"Cart still has {cart['item_count']} items after clearing.", code="cart_clear_incomplete")
         return cart
@@ -644,6 +728,7 @@ class ShufersalDriver:
         return {
             "items": items,
             "item_count": len(items),
+            "lines_complete": True,
             "subtotal_ils": subtotal,
             "delivery_fee_ils": None,
             "total_ils": subtotal,
@@ -673,6 +758,10 @@ class ShufersalDriver:
         cart = await self._get_cart_unlocked()
         if not cart["items"]:
             raise APIException(status_code=409, code="cart_empty", message="The cart is empty.")
+        if not cart.get("lines_complete", False):
+            raise APIException(status_code=409, code="cart_incomplete",
+                               message=f"The site counts {cart['item_count']} cart items but the page showed "
+                                       f"{len(cart['items'])} lines; refusing to quote a partial cart.")
         slots = await self._get_delivery_slots_unlocked()
         slot = next((s for s in slots if s["id"] == str(slot_id)), None)
         if not slot or not slot["available"]:

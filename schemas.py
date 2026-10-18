@@ -48,6 +48,8 @@ class CartItem(BaseModel):
 class CartResponse(BaseModel):
     items: List[CartItem]
     item_count: Optional[int] = None
+    # False when the site's item count disagrees with the lines the page showed.
+    lines_complete: bool = True
     subtotal_ils: float
     # Depends on the delivery slot; None until a checkout quote picks one.
     delivery_fee_ils: Optional[float] = None
@@ -73,6 +75,8 @@ class CartItemAddRequest(BaseModel):
 
 class CartItemUpdateRequest(BaseModel):
     qty: float = Field(ge=0)
+    # Required: the product on the line. Line ids shift when lines are removed.
+    product_code: Optional[str] = None
 
 class CartBatchItem(BaseModel):
     product_id: str

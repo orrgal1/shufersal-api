@@ -133,25 +133,45 @@ async def get_cart():
     cart = await shufersal_driver.get_cart()
     return CartResponse(**cart)
 
-@app.post("/cart/items", response_model=CartResponse)
+RETRY_NOTE = ("Retries: send an Idempotency-Key. The planned target is recorded before any write, so a "
+              "retry after an uncertain failure reconciles against the live cart instead of adding again. "
+              "Without a key, GET /cart before retrying a failed write.")
+PENDING = 0  # idempotency_store status for a planned write whose outcome is not yet known
+
+
+async def _planned_add(endpoint: str, items, clear_first: bool, idempotency_key: Optional[str]):
+    plan = None
+    if idempotency_key:
+        cached = idempotency_store.get(idempotency_key)
+        if cached and cached["status_code"] != PENDING:
+            log_mutation("POST", endpoint, cached["status_code"], idempotency_key, {"cached": True})
+            return JSONResponse(status_code=cached["status_code"], content=cached["body"])
+        if cached:
+            plan = cached["body"]["plan"]  # an earlier attempt with this key may have written
+    record = (lambda p: idempotency_store.set(idempotency_key, PENDING, {"plan": p})) if idempotency_key else None
+    cart = CartResponse(**(await shufersal_driver.add_items(items, clear_first=clear_first, plan=plan, on_plan=record)))
+    if idempotency_key:
+        idempotency_store.set(idempotency_key, 200, cart.model_dump())
+    log_mutation("POST", endpoint, 200, idempotency_key, {"count": len(items), "reconciled": plan is not None})
+    return cart
+
+
+def _cached(method: str, path: str, idempotency_key: Optional[str]):
+    if idempotency_key:
+        cached = idempotency_store.get(idempotency_key)
+        if cached and cached["status_code"] != PENDING:
+            log_mutation(method, path, cached["status_code"], idempotency_key, {"cached": True})
+            return JSONResponse(status_code=cached["status_code"], content=cached["body"])
+    return None
+
+
+@app.post("/cart/items", response_model=CartResponse, description=RETRY_NOTE)
 async def add_cart_item(
     payload: CartItemAddRequest,
     idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key")
 ):
-    """POST /cart/items body:{product_id, qty} Idempotency-Key header optional -> updated cart"""
-    if idempotency_key:
-        cached = idempotency_store.get(idempotency_key)
-        if cached:
-            log_mutation("POST", "/cart/items", cached["status_code"], idempotency_key, {"cached": True})
-            return JSONResponse(status_code=cached["status_code"], content=cached["body"])
-
-    updated_cart = await shufersal_driver.add_to_cart(product_id=payload.product_id, qty=payload.qty)
-    
-    if idempotency_key:
-        idempotency_store.set(idempotency_key, 200, updated_cart)
-
-    log_mutation("POST", "/cart/items", 200, idempotency_key, {"product_id": payload.product_id, "qty": payload.qty})
-    return CartResponse(**updated_cart)
+    """POST /cart/items body:{product_id, qty} -> updated cart (adds qty to any existing line)"""
+    return await _planned_add("/cart/items", [(payload.product_id, payload.qty)], False, idempotency_key)
 
 @app.patch("/cart/items/{line_id}", response_model=CartResponse)
 async def update_cart_item(
@@ -159,38 +179,34 @@ async def update_cart_item(
     payload: CartItemUpdateRequest,
     idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key")
 ):
-    """PATCH /cart/items/{line_id} body:{qty} (qty=0 removes) -> updated cart"""
-    if idempotency_key:
-        cached = idempotency_store.get(idempotency_key)
-        if cached:
-            log_mutation("PATCH", f"/cart/items/{line_id}", cached["status_code"], idempotency_key, {"cached": True})
-            return JSONResponse(status_code=cached["status_code"], content=cached["body"])
-
-    updated_cart = await shufersal_driver.update_cart_item(line_id=line_id, qty=payload.qty)
-    
+    """PATCH /cart/items/{line_id} body:{qty, product_code} (qty=0 removes) -> updated cart.
+    product_code is required: line ids shift when lines are removed, so the line is
+    re-resolved by product code if line_id no longer points at that product. Setting a
+    quantity is idempotent, so retrying is safe."""
+    cached = _cached("PATCH", f"/cart/items/{line_id}", idempotency_key)
+    if cached:
+        return cached
+    updated_cart = await shufersal_driver.update_cart_item(line_id=line_id, qty=payload.qty, product_code=payload.product_code)
     if idempotency_key:
         idempotency_store.set(idempotency_key, 200, updated_cart)
-
     log_mutation("PATCH", f"/cart/items/{line_id}", 200, idempotency_key, {"line_id": line_id, "qty": payload.qty})
     return CartResponse(**updated_cart)
 
 @app.delete("/cart/items/{line_id}", response_model=CartResponse)
 async def delete_cart_item(
     line_id: str,
+    product_code: Optional[str] = None,
     idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key")
 ):
-    """DELETE /cart/items/{line_id} -> updated cart"""
-    if idempotency_key:
-        cached = idempotency_store.get(idempotency_key)
-        if cached:
-            log_mutation("DELETE", f"/cart/items/{line_id}", cached["status_code"], idempotency_key, {"cached": True})
-            return JSONResponse(status_code=cached["status_code"], content=cached["body"])
-
-    updated_cart = await shufersal_driver.delete_cart_item(line_id=line_id)
-
+    """DELETE /cart/items/{line_id}?product_code=<code> -> updated cart.
+    product_code is required (see PATCH). Removing a product that is already gone
+    returns the current cart, so retrying is safe."""
+    cached = _cached("DELETE", f"/cart/items/{line_id}", idempotency_key)
+    if cached:
+        return cached
+    updated_cart = await shufersal_driver.delete_cart_item(line_id=line_id, product_code=product_code)
     if idempotency_key:
         idempotency_store.set(idempotency_key, 200, updated_cart)
-
     log_mutation("DELETE", f"/cart/items/{line_id}", 200, idempotency_key, {"line_id": line_id})
     return CartResponse(**updated_cart)
 
@@ -198,48 +214,25 @@ async def delete_cart_item(
 async def clear_cart(
     idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key")
 ):
-    """DELETE /cart -> {items:[], total_ils:0}"""
-    if idempotency_key:
-        cached = idempotency_store.get(idempotency_key)
-        if cached:
-            log_mutation("DELETE", "/cart", cached["status_code"], idempotency_key, {"cached": True})
-            return JSONResponse(status_code=cached["status_code"], content=cached["body"])
-
+    """DELETE /cart -> the re-read (empty) cart. Idempotent."""
+    cached = _cached("DELETE", "/cart", idempotency_key)
+    if cached:
+        return cached
     # The driver loops until the site cart is empty and returns the re-read cart.
     response_data = CartResponse(**(await shufersal_driver.clear_cart())).model_dump()
-
     if idempotency_key:
         idempotency_store.set(idempotency_key, 200, response_data)
-
     log_mutation("DELETE", "/cart", 200, idempotency_key, {"action": "clear_cart"})
     return response_data
-@app.post("/cart/batch", response_model=CartResponse)
+
+@app.post("/cart/batch", response_model=CartResponse, description=RETRY_NOTE)
 async def batch_cart_items(
     payload: CartBatchRequest,
     idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key")
 ):
     """POST /cart/batch body:{items:[{product_id, qty}], clear_first:bool} -> updated cart"""
-    if idempotency_key:
-        cached = idempotency_store.get(idempotency_key)
-        if cached:
-            log_mutation("POST", "/cart/batch", cached["status_code"], idempotency_key, {"cached": True})
-            return JSONResponse(status_code=cached["status_code"], content=cached["body"])
-
-    if payload.clear_first:
-        await shufersal_driver.clear_cart()
-
-    last_cart = None
-    for item in payload.items:
-        last_cart = await shufersal_driver.add_to_cart(product_id=item.product_id, qty=item.qty)
-
-    if last_cart is None:
-        last_cart = await shufersal_driver.get_cart()
-
-    if idempotency_key:
-        idempotency_store.set(idempotency_key, 200, last_cart)
-
-    log_mutation("POST", "/cart/batch", 200, idempotency_key, {"count": len(payload.items), "clear_first": payload.clear_first})
-    return CartResponse(**last_cart)
+    return await _planned_add("/cart/batch", [(i.product_id, i.qty) for i in payload.items],
+                              payload.clear_first, idempotency_key)
 
 @app.post("/cart/clear")
 async def clear_cart_post(
@@ -260,10 +253,11 @@ async def update_cart_item_put(
 @app.post("/cart/items/{line_id}/delete", response_model=CartResponse)
 async def delete_cart_item_post(
     line_id: str,
+    product_code: Optional[str] = None,
     idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key")
 ):
-    """POST /cart/items/{line_id}/delete -> alias for DELETE /cart/items/{line_id}"""
-    return await delete_cart_item(line_id=line_id, idempotency_key=idempotency_key)
+    """POST /cart/items/{line_id}/delete?product_code=<code> -> alias for DELETE /cart/items/{line_id}"""
+    return await delete_cart_item(line_id=line_id, product_code=product_code, idempotency_key=idempotency_key)
 
 @app.get("/delivery/slots", response_model=DeliverySlotsResponse)
 async def get_delivery_slots():
