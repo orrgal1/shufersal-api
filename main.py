@@ -195,8 +195,8 @@ async def clear_cart(
             log_mutation("DELETE", "/cart", cached["status_code"], idempotency_key, {"cached": True})
             return JSONResponse(status_code=cached["status_code"], content=cached["body"])
 
-    empty_cart = await shufersal_driver.clear_cart()
-    response_data = {"items": [], "total_ils": 0}
+    # The driver loops until the site cart is empty and returns the re-read cart.
+    response_data = CartResponse(**(await shufersal_driver.clear_cart())).model_dump()
 
     if idempotency_key:
         idempotency_store.set(idempotency_key, 200, response_data)
@@ -282,7 +282,13 @@ async def create_checkout_quote(
     cart = await shufersal_driver.get_cart()
     slots = await shufersal_driver.get_delivery_slots()
     selected_slot = next((s for s in slots if s["id"] == delivery_slot_id), None)
-    delivery_fee = selected_slot["fee_ils"] if selected_slot else cart["delivery_fee_ils"]
+    if not selected_slot or not selected_slot["available"]:
+        raise APIException(
+            status_code=status.HTTP_409_CONFLICT,
+            code="slot_unavailable",
+            message=f"Delivery slot {delivery_slot_id} is not offered or not available."
+        )
+    delivery_fee = selected_slot["fee_ils"]
     total = cart["subtotal_ils"] + delivery_fee
     item_count = sum(int(item["qty"]) for item in cart["items"])
 

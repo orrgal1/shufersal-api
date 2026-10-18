@@ -40,14 +40,21 @@ class CartItem(BaseModel):
     product_id: str
     name: str
     qty: float
-    unit_price_ils: float
-    line_total_ils: float
+    selling_method: Optional[str] = None
+    # None when the site price could not be read; never a silent 0.
+    unit_price_ils: Optional[float] = None
+    line_total_ils: Optional[float] = None
 
 class CartResponse(BaseModel):
     items: List[CartItem]
+    item_count: Optional[int] = None
     subtotal_ils: float
-    delivery_fee_ils: float
+    # Depends on the delivery slot; None until a checkout quote picks one.
+    delivery_fee_ils: Optional[float] = None
     total_ils: float
+    total_includes_delivery: bool = False
+    prices_complete: bool = True
+    cart_hash: Optional[str] = None
 
 class CartItemAddRequest(BaseModel):
     product_id: str
@@ -92,6 +99,8 @@ class DeliverySlot(BaseModel):
     window: str
     fee_ils: float
     available: bool
+    start: Optional[str] = None
+    end: Optional[str] = None
 
 class DeliverySlotsResponse(BaseModel):
     slots: List[DeliverySlot]

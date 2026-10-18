@@ -2,33 +2,58 @@ import asyncio
 import logging
 import re
 import time
-from urllib.parse import quote
 from typing import Optional, Dict, Any, List, Tuple
-from datetime import datetime, timezone, timedelta
+from urllib.parse import quote, urlencode
+import json
 
 import config
-from security import sanitize_log_message, APIException
+from security import APIException
+from shufersal_parsers import (
+    ParseError,
+    cart_hash,
+    clean_code,
+    find_exact,
+    parse_cart_entries,
+    parse_home_delivery_slots,
+    parse_minicart,
+    parse_payment_method,
+    parse_search_results,
+    public_payment,
+    site_code,
+)
 
 logger = logging.getLogger("shufersal_driver")
 
+BASE = "/online/he"
+CART_CONTEXT = urlencode({"cartContext[openFrom]": "CATALOG", "cartContext[recommendationType]": "REGULAR"})
+QTY_TOLERANCE = 0.001
+
+
+def _upstream(message: str, code: str = "upstream_error", status: int = 502) -> APIException:
+    return APIException(status_code=status, code=code, message=message)
+
+
 class ShufersalDriver:
     """
-    Hybrid driver combining Playwright persistent context (for WAF/Cloudflare,
-    session survival, and PCI iframe interaction) with direct in-page network
-    protocol calls for ultra-fast, robust JSON operations.
+    Playwright persistent context (for the WAF, the session and cookies) driving
+    the site's own XHR endpoints from inside the page. Every write is verified
+    by re-reading the cart; nothing falls back to fixture data outside MOCK_MODE.
     """
+    LIVE_RETRY_SECONDS = 60
+
     def __init__(self):
         self.playwright = None
         self.context = None
         self.page = None
         self._lock = asyncio.Lock()
         self._is_started = False
-        self._csrf_token: Optional[str] = None
+        self._context_closed = False
         # Why the live browser is unavailable (None when live or in MOCK_MODE).
         self._live_error: Optional[str] = None
         self._last_live_attempt: float = 0.0
-        
-        # Internal mock store used when MOCK_MODE=True or for test verification
+        self._last_launch_failed = False
+
+        # Internal mock store used only when MOCK_MODE=True (tests/demo).
         self._mock_logged_in = True
         self._mock_cart: List[Dict[str, Any]] = [
             {
@@ -42,24 +67,23 @@ class ShufersalDriver:
         ]
         self._mock_delivery_fee = 29.90
 
+    # ==================== Lifecycle ====================
+
     async def start(self, headless: Optional[bool] = None, user_data_dir: Optional[str] = None):
         """Initializes Playwright persistent context or mock mode."""
         if self._is_started:
             return
-
+        self._is_started = True
         if config.MOCK_MODE:
             logger.info("Starting ShufersalDriver in MOCK_MODE.")
-            self._is_started = True
             return
-
-        self._is_started = True
         await self._start_live(headless=headless, user_data_dir=user_data_dir)
 
     async def _start_live(self, headless: Optional[bool] = None, user_data_dir: Optional[str] = None) -> bool:
         """Launches the live Playwright context. On failure, records the reason and
-        leaves the driver unavailable. It never falls back to fixture data: callers
-        get a 503 instead of fake search results, carts or login status."""
+        leaves the driver unavailable (callers get 503, never fixture data)."""
         self._last_live_attempt = time.monotonic()
+        await self._teardown_browser()
         try:
             from playwright.async_api import async_playwright
             if self.playwright is None:
@@ -80,10 +104,12 @@ class ShufersalDriver:
                     "--no-sandbox"
                 ]
             )
+            self._context_closed = False
+            ctx = self.context
+            ctx.on("close", lambda *_: self._mark_dead("browser context closed", ctx))
 
             pages = self.context.pages
             page = pages[0] if pages else await self.context.new_page()
-            # Import authenticated session from Chrome if available
             try:
                 imported_cookies = self._extract_chrome_session_cookies()
                 if imported_cookies:
@@ -92,11 +118,12 @@ class ShufersalDriver:
             except Exception as e:
                 logger.warning(f"Could not import Chrome session cookies: {e}")
 
-            # Navigate to base URL to initialize session & extract CSRF
-            await page.goto(config.SHUFERSAL_BASE_URL, wait_until="domcontentloaded", timeout=45000)
+            await page.goto(config.SHUFERSAL_BASE_URL + BASE + "/", wait_until="domcontentloaded", timeout=45000)
+            page.on("close", lambda *_: self._mark_dead("page closed", page))
+            page.on("crash", lambda *_: self._mark_dead("page crashed", page))
             self.page = page
-            await self._refresh_csrf_token()
             self._live_error = None
+            self._last_launch_failed = False
             logger.info("Playwright persistent context started successfully.")
             return True
         except Exception as e:
@@ -104,24 +131,48 @@ class ShufersalDriver:
             if "Executable doesn't exist" in str(e):
                 reason += " (run `venv/bin/python -m playwright install chromium`)"
             self._live_error = reason
-            self.page = None
-            if self.context:
-                try:
-                    await self.context.close()
-                except Exception:
-                    pass
-                self.context = None
+            self._last_launch_failed = True
+            await self._teardown_browser()
             logger.error(f"Live Playwright context unavailable: {reason}. Live endpoints will return 503 until it starts.")
             return False
 
-    LIVE_RETRY_SECONDS = 60
+    def _mark_dead(self, reason: str, owner: Any = None):
+        # Events from a context/page we already replaced must not kill the new one.
+        if owner is not None and owner is not self.context and owner is not self.page:
+            return
+        if not self._context_closed:
+            logger.warning(f"Live browser lost: {reason}; it will be relaunched on the next request.")
+        self._context_closed = True
+        self._live_error = reason
+
+    def _is_alive(self) -> bool:
+        if self.page is None or self.context is None or self._context_closed:
+            return False
+        try:
+            return not self.page.is_closed()
+        except Exception:
+            return False
+
+    async def _teardown_browser(self):
+        page, context = self.page, self.context
+        self.page = None
+        self.context = None
+        if context is not None:
+            try:
+                await context.close()
+            except Exception:
+                pass
 
     async def _require_live(self):
-        """Ensures a live page exists outside MOCK_MODE, retrying the browser launch
-        at most once per LIVE_RETRY_SECONDS. Raises 503 when it is unavailable."""
-        if config.MOCK_MODE or self.page:
+        """Ensures a live page exists outside MOCK_MODE. A dead page or context
+        is relaunched; failed launches are retried at most once per
+        LIVE_RETRY_SECONDS. Raises 503 when no live browser is available."""
+        if config.MOCK_MODE or self._is_alive():
             return
-        if self._is_started and time.monotonic() - self._last_live_attempt >= self.LIVE_RETRY_SECONDS:
+        # A browser that was running and died is relaunched at once; a launch
+        # that failed is retried at most once per LIVE_RETRY_SECONDS.
+        throttled = self._last_launch_failed and time.monotonic() - self._last_live_attempt < self.LIVE_RETRY_SECONDS
+        if self._is_started and not throttled:
             if await self._start_live():
                 return
         raise APIException(
@@ -131,41 +182,20 @@ class ShufersalDriver:
                     + (f"Cause: {self._live_error}" if self._live_error else "The driver has not started.")
         )
 
-    def _not_live_implemented(self, what: str):
-        raise APIException(
-            status_code=501,
-            code="not_implemented",
-            message=f"{what} is not implemented against the live site; only MOCK_MODE returns fixture data."
-        )
-
     async def stop(self):
         """Cleanly releases browser resources."""
         if not self._is_started:
             return
-        if self.context:
-            try:
-                await self.context.close()
-            except Exception:
-                pass
+        await self._teardown_browser()
         if self.playwright:
             try:
                 await self.playwright.stop()
             except Exception:
                 pass
+            self.playwright = None
         self._is_started = False
 
-    async def _refresh_csrf_token(self):
-        """Extracts CSRF token from page DOM/window."""
-        if not self.page:
-            return
-        try:
-            token = await self.page.evaluate(
-                "() => window.ACC?.config?.CSRFToken || document.querySelector('meta[name=\"_csrf\"]')?.content || document.querySelector('input[name=\"CSRFToken\"]')?.value || null"
-            )
-            if token:
-                self._csrf_token = token
-        except Exception:
-            pass
+
     def _extract_chrome_session_cookies(self) -> List[Dict[str, Any]]:
         """Extracts and decrypts Shufersal cookies from local Chrome profile on macOS in headless mode."""
         import sqlite3, os, hashlib, subprocess
@@ -221,48 +251,61 @@ class ShufersalDriver:
             logger.warning(f"Error reading Chrome cookies: {e}")
             return []
 
-    async def _in_page_fetch(self, path: str, method: str = "GET", body: Optional[dict] = None) -> Tuple[int, Any]:
-        """
-        Executes a direct fetch inside the browser page context, automatically
-        inheriting all cookies, CSRF tokens, and bypassing Cloudflare bot checks.
-        """
-        if not self.page:
-            raise RuntimeError("Browser page not initialized")
+    # ==================== In-page HTTP ====================
 
-        await self._refresh_csrf_token()
+    async def _fetch(
+        self,
+        path: str,
+        method: str = "GET",
+        body: Optional[str] = None,
+        content_type: Optional[str] = None,
+    ) -> Tuple[int, str, str]:
+        """Runs fetch() inside the page so the request carries the session
+        cookies, the WAF clearance and the page's CSRF token.
+        Returns (status, final URL path, body text)."""
+        await self._require_live()
         url = f"{config.SHUFERSAL_BASE_URL.rstrip('/')}/{path.lstrip('/')}"
-        
         script = """
-        async ([url, method, body, csrf]) => {
+        async ([url, method, body, contentType]) => {
             const headers = {
-                'Accept': 'application/json, text/plain, */*',
+                'Accept': 'application/json, text/html, */*',
                 'X-Requested-With': 'XMLHttpRequest'
             };
-            if (csrf) {
-                headers['CSRFToken'] = csrf;
-            }
+            const csrf = window.ACC?.config?.CSRFToken;
+            if (csrf) headers['CSRFToken'] = csrf;
+            if (contentType) headers['Content-Type'] = contentType;
             const opts = { method, headers, credentials: 'include' };
-            if (body && method !== 'GET') {
-                headers['Content-Type'] = 'application/json';
-                opts.body = JSON.stringify(body);
-            }
+            if (body !== null && method !== 'GET') opts.body = body;
             try {
                 const res = await fetch(url, opts);
-                const contentType = res.headers.get('content-type') || '';
-                let data = null;
-                if (contentType.includes('application/json')) {
-                    data = await res.json();
-                } else {
-                    data = await res.text();
-                }
-                return { status: res.status, data };
+                return { status: res.status, url: res.url, text: await res.text() };
             } catch (err) {
-                return { status: 0, error: err.toString() };
+                return { status: 0, url: url, text: String(err) };
             }
         }
         """
-        res = await self.page.evaluate(script, [url, method, body, self._csrf_token])
-        return res.get("status", 0), res.get("data")
+        try:
+            res = await self.page.evaluate(script, [url, method, body, content_type])
+        except Exception as e:
+            if not self._is_alive() or "closed" in str(e).lower() or "crash" in str(e).lower():
+                self._mark_dead(f"page unusable: {str(e)[:120]}")
+                raise APIException(status_code=503, code="browser_unavailable",
+                                   message="The live browser session was lost; retry shortly.")
+            raise _upstream(f"In-page request to {path.split('?')[0]} failed.")
+        status = int(res.get("status") or 0)
+        final = str(res.get("url") or "").replace(config.SHUFERSAL_BASE_URL.rstrip("/"), "")
+        if status == 0:
+            raise _upstream(f"Network error calling {path.split('?')[0]}.")
+        return status, final, res.get("text") or ""
+
+    async def _fetch_json(self, path: str) -> Any:
+        status, final, text = await self._fetch(path)
+        if status != 200:
+            raise _upstream(f"{path.split('?')[0]} returned HTTP {status}.")
+        try:
+            return json.loads(text)
+        except ValueError:
+            raise _upstream(f"{path.split('?')[0]} did not return JSON (landed on {final.split('?')[0]}).")
 
     # ==================== Health & Login ====================
 
@@ -271,86 +314,28 @@ class ShufersalDriver:
             return await self._check_login_status_unlocked()
 
     async def _check_login_status_unlocked(self) -> Tuple[bool, int]:
-        await self._require_live()
         if config.MOCK_MODE:
-            cart_count = sum(int(item["qty"]) for item in self._mock_cart)
-            return self._mock_logged_in, cart_count
-
-        try:
-            if not self.page.url.startswith("http"):
-                await self.page.goto(config.SHUFERSAL_BASE_URL, wait_until="domcontentloaded", timeout=25000)
-
-            auth_res = await self.page.evaluate(
-                "() => fetch('/online/he/authentication/get-status-includes-otp').then(r => r.text()).catch(() => 'false')"
-            )
-            cookies = await self.context.cookies()
-            has_session = any(c.get("name") in ("acceleratorSecureGUID", "miglogstorefrontRememberMe") for c in cookies)
-            is_logged_in = (auth_res.strip().lower() == "true") or has_session
-            cart_size = await self.page.evaluate('''() => {
-                return fetch('/online/he/cart/miniCart/TOTAL')
-                    .then(r => r.text())
-                    .then(t => {
-                        const m = t.match(/"miniCartCount"\\s*:\\s*(\\d+)/);
-                        return m ? parseInt(m[1]) : 0;
-                    })
-                    .catch(() => 0);
-            }''')
-            
-            return is_logged_in, int(cart_size or 0)
-        except Exception as e:
-            logger.warning(f"Error checking live login status: {e}")
-            raise APIException(
-                status_code=502,
-                code="upstream_error",
-                message="Could not read live login status from Shufersal."
-            )
+            return self._mock_logged_in, sum(int(item["qty"]) for item in self._mock_cart)
+        status, final, _ = await self._fetch(BASE + "/my-account")
+        # Anonymous sessions are redirected to the login page.
+        logged_in = status == 200 and "/login" not in final
+        count, _ = await self._minicart()
+        return logged_in, count
 
     # ==================== Catalog & Search ====================
+
+    async def _search_json(self, query: str, limit: int) -> List[Dict[str, Any]]:
+        data = await self._fetch_json(f"{BASE}/search/results?q={quote(query, safe='')}&limit={int(limit)}")
+        try:
+            return parse_search_results(data)
+        except ParseError as e:
+            raise _upstream(f"Unexpected search response: {e}")
 
     async def search_products(self, query: str, limit: int = 20) -> List[Dict[str, Any]]:
         async with self._lock:
             return await self._search_products_unlocked(query, limit)
 
     async def _search_products_unlocked(self, query: str, limit: int = 20) -> List[Dict[str, Any]]:
-        await self._require_live()
-        if self.page and not config.MOCK_MODE:
-            try:
-                search_url = f"{config.SHUFERSAL_BASE_URL.rstrip('/')}/online/he/search?text={quote(query, safe='')}"
-                await self.page.goto(search_url, wait_until="domcontentloaded", timeout=25000)
-                await self.page.wait_for_timeout(1500)
-                
-                items = await self.page.evaluate('''() => {
-                    const results = [];
-                    const seen = new Set();
-                    document.querySelectorAll('li[data-product-code], .tileBlock[data-product-code]').forEach(el => {
-                        const rawCode = el.getAttribute('data-product-code') || '';
-                        const code = rawCode.replace(/^P_/, '');
-                        if (!code || seen.has(code)) return;
-                        seen.add(code);
-                        const name = el.getAttribute('data-product-name') || el.querySelector('.text, .name')?.innerText?.trim() || '';
-                        const priceStr = el.getAttribute('data-product-price') || '0';
-                        const price = parseFloat(priceStr) || 0.0;
-                        const brand = el.querySelector('.brand, [data-brand]')?.innerText?.trim() || 'שופרסל';
-                        const img = el.querySelector('img.miglog-prod-img, img')?.src || '';
-                        const inStock = el.querySelector('.miglog-prod-inStock') !== null && el.querySelector('.miglog-prod-outOfStock') === null;
-                        if (name) {
-                            results.push({
-                                id: code,
-                                name: name,
-                                brand: brand,
-                                price_ils: price,
-                                unit: 'יחידה',
-                                image_url: img,
-                                in_stock: inStock
-                            });
-                        }
-                    });
-                    return results;
-                }''')
-                return items[:limit] if items else []
-            except Exception as e:
-                logger.warning(f"Live search failed: {e}")
-                raise APIException(status_code=502, code="upstream_error", message="Live Shufersal search failed.")
         if config.MOCK_MODE:
             catalog = [
                 {"id": "P12345", "name": "חלב תנובה 3% בקרטון 1 ליטר", "brand": "תנובה", "price_ils": 7.10, "unit": "יחידה", "image_url": "https://media.shufersal.co.il/images/products/milk_3.jpg", "in_stock": True},
@@ -359,317 +344,216 @@ class ShufersalDriver:
             q_low = query.lower()
             matches = [p for p in catalog if q_low in p["name"].lower() or q_low in p["brand"].lower() or q_low in p["id"].lower()]
             return (matches or catalog)[:limit]
+        return (await self._search_json(query, limit))[:limit]
 
-        return []
+    async def _lookup_product(self, product_id: str) -> Optional[Dict[str, Any]]:
+        code = clean_code(product_id)
+        if not re.fullmatch(r"\d{1,20}", code):
+            return None
+        return find_exact(await self._search_json(code, 20), code)
+
     async def get_product(self, product_id: str) -> Optional[Dict[str, Any]]:
         async with self._lock:
             return await self._get_product_unlocked(product_id)
 
     async def _get_product_unlocked(self, product_id: str) -> Optional[Dict[str, Any]]:
-        clean_id = product_id.replace("P_", "")
-        await self._require_live()
-        if not config.MOCK_MODE and self.page:
-            try:
-                prods = await self._search_products_unlocked(clean_id, limit=20)
-                # Only an exact code match counts; a fuzzy first hit is a different product.
-                p = next((x for x in prods if x["id"] == clean_id), None)
-                if p:
-                    return {
-                        "id": p["id"],
-                        "name": p["name"],
-                        "description": p["name"],
-                        "price_ils": p["price_ils"],
-                        "sale_price_ils": None,
-                        "unit": p.get("unit", "יחידה"),
-                        "nutrition_url": None,
-                        "in_stock": p.get("in_stock", True)
-                    }
-            except APIException:
-                raise
-            except Exception as e:
-                logger.warning(f"Live get_product failed for {product_id}: {e}")
-
         if config.MOCK_MODE:
-            catalog = {
-                "P12345": {
-                    "id": "P12345",
-                    "name": "חלב תנובה 3% בקרטון 1 ליטר",
-                    "description": "חלב מפוסטר הומוגני 3% שומן מועשר בוויטמין D",
-                    "price_ils": 7.10,
-                    "sale_price_ils": None,
-                    "unit": "יחידה",
-                    "nutrition_url": "https://media.shufersal.co.il/nutrition/P12345.pdf",
-                    "in_stock": True
-                },
-                "P54321": {
-                    "id": "P54321",
-                    "name": "קוטג' תנובה 5% 250 גרם",
-                    "description": "גבינת קוטג' 5% שומן עשירה בחלבון",
-                    "price_ils": 6.50,
-                    "sale_price_ils": 5.90,
-                    "unit": "יחידה",
-                    "nutrition_url": None,
-                    "in_stock": True
-                }
-            }
-            if product_id in catalog:
-                return catalog[product_id]
-            if clean_id in catalog:
-                return catalog[clean_id]
-            return {
-                "id": product_id,
-                "name": f"מוצר {product_id}",
-                "description": f"תיאור פריט {product_id}",
-                "price_ils": 10.0,
-                "sale_price_ils": None,
-                "unit": "יחידה",
-                "nutrition_url": None,
-                "in_stock": True
-            }
-
-        return None
-
-    # ==================== Cart Operations ====================
-
-    def _calculate_mock_cart(self) -> Dict[str, Any]:
-        subtotal = sum(round(item["qty"] * item["unit_price_ils"], 2) for item in self._mock_cart)
-        fee = self._mock_delivery_fee if self._mock_cart else 0.0
-        total = round(subtotal + fee, 2)
+            return self._mock_product(product_id)
+        p = await self._lookup_product(product_id)
+        if not p:
+            return None
         return {
-            "items": [dict(i) for i in self._mock_cart],
-            "subtotal_ils": round(subtotal, 2),
-            "delivery_fee_ils": round(fee, 2),
-            "total_ils": total
+            "id": p["id"],
+            "name": p["name"],
+            "description": p.get("description") or p["name"],
+            "price_ils": p["price_ils"],
+            "sale_price_ils": p.get("sale_price_ils"),
+            "unit": p.get("unit", "יחידה"),
+            "nutrition_url": None,
+            "in_stock": p.get("in_stock", True),
         }
+
+    # ==================== Cart (live) ====================
+
+    async def _minicart(self) -> Tuple[int, float]:
+        status, _, text = await self._fetch(BASE + "/cart/miniCart/TOTAL")
+        if status != 200:
+            raise _upstream(f"Cart count request returned HTTP {status}.")
+        try:
+            return parse_minicart(text)
+        except ParseError as e:
+            raise _upstream(f"Unexpected cart count response: {e}")
+
+    async def _read_cart(self) -> Dict[str, Any]:
+        """Reads the real cart: site item count and subtotal from the mini-cart,
+        entries (exact entry numbers, codes, quantities) from the cart HTML."""
+        count, subtotal = await self._minicart()
+        status, _, html = await self._fetch(BASE + "/cart/load")
+        if status != 200:
+            raise _upstream(f"Cart request returned HTTP {status}.")
+        try:
+            entries = parse_cart_entries(html)
+        except ParseError as e:
+            raise _upstream(f"Unexpected cart markup: {e}")
+        if count > 0 and not entries:
+            raise _upstream(f"The site reports {count} cart items but none could be read.")
+
+        items = []
+        prices_complete = True
+        for e in entries:
+            unit = e.get("unit_price_attr")
+            if unit is None:
+                try:
+                    prod = await self._lookup_product(e["product_id"])
+                    unit = prod["price_ils"] if prod else None
+                except APIException as exc:
+                    if exc.status_code == 503:
+                        raise
+                    unit = None
+            if unit is None:
+                prices_complete = False
+            items.append({
+                "line_id": e["line_id"],
+                "product_id": e["product_id"],
+                "name": e["name"] or e["product_id"],
+                "qty": e["qty"],
+                "selling_method": e["selling_method"],
+                "unit_price_ils": unit,
+                "line_total_ils": round(unit * e["qty"], 2) if unit is not None else None,
+            })
+        return {
+            "items": items,
+            "item_count": count,
+            "subtotal_ils": round(subtotal, 2),
+            # The fee depends on the chosen slot; see /delivery/slots and the checkout quote.
+            "delivery_fee_ils": None,
+            "total_ils": round(subtotal, 2),
+            "total_includes_delivery": False,
+            "prices_complete": prices_complete,
+            "cart_hash": cart_hash(items),
+        }
+
+    @staticmethod
+    def _line_for(cart: Dict[str, Any], product_id: str) -> Optional[Dict[str, Any]]:
+        code = clean_code(product_id)
+        return next((i for i in cart["items"] if i["product_id"] == code), None)
+
+    @staticmethod
+    def _entry(cart: Dict[str, Any], line_id: str) -> Dict[str, Any]:
+        entry = next((i for i in cart["items"] if i["line_id"] == str(line_id)), None)
+        if entry is None:
+            raise APIException(status_code=404, code="item_not_found", message=f"Cart line {line_id} is not in the cart.")
+        return entry
+
+    async def _post_update(self, line_id: str, qty: float, selling_method: str):
+        params = urlencode({"entryNumber": line_id, "qty": _fmt_qty(qty), "sellingMethod": selling_method})
+        status, _, _ = await self._fetch(
+            f"{BASE}/cart/update?{params}",
+            method="POST",
+            body=urlencode({"quantity": _fmt_qty(qty)}),
+            content_type="application/x-www-form-urlencoded; charset=UTF-8",
+        )
+        if status != 200:
+            raise _upstream(f"Cart update returned HTTP {status}.", code="cart_write_failed")
+
+    async def _post_add(self, product: Dict[str, Any], qty: float):
+        payload = {
+            "productCodePost": site_code(product["id"]),
+            "productCode": site_code(product["id"]),
+            "sellingMethod": product.get("selling_method") or "BY_UNIT",
+            "qty": qty,
+            "frontQuantity": qty,
+            "comment": "",
+            "affiliateCode": "",
+        }
+        status, _, _ = await self._fetch(
+            f"{BASE}/cart/add?{CART_CONTEXT}",
+            method="POST",
+            body=json.dumps(payload),
+            content_type="application/json",
+        )
+        if status != 200:
+            raise _upstream(f"Add to cart returned HTTP {status}.", code="cart_write_failed")
+
+    @staticmethod
+    def _verify_qty(cart: Dict[str, Any], product_id: str, expected: float, action: str):
+        line = ShufersalDriver._line_for(cart, product_id)
+        actual = line["qty"] if line else 0.0
+        if abs(actual - expected) > QTY_TOLERANCE:
+            raise _upstream(
+                f"{action} for product {clean_code(product_id)} was not applied: "
+                f"expected quantity {expected}, cart shows {actual}.",
+                code="cart_write_unverified",
+            )
 
     async def get_cart(self) -> Dict[str, Any]:
         async with self._lock:
             return await self._get_cart_unlocked()
 
     async def _get_cart_unlocked(self) -> Dict[str, Any]:
-        await self._require_live()
-        if self.page and not config.MOCK_MODE:
-            try:
-                mini_count = await self.page.evaluate('''() => fetch('/online/he/cart/miniCart/TOTAL')
-                    .then(r => r.text())
-                    .then(t => {
-                        const m = t.match(/"miniCartCount"\\s*:\\s*(\\d+)/);
-                        return m ? parseInt(m[1]) : 0;
-                    }).catch(() => 0)''')
-                
-                if int(mini_count or 0) == 0:
-                    return {
-                        "items": [],
-                        "subtotal_ils": 0.0,
-                        "delivery_fee_ils": 0.0,
-                        "total_ils": 0.0
-                    }
-
-                cart_data = await self.page.evaluate('''() => {
-                    const items = [];
-                    document.querySelectorAll('#cartMiddleContent .miglog-prod, .miglog-cart-prod-wrp .miglog-prod').forEach(el => {
-                        const rawCode = el.getAttribute('data-product-code') || el.querySelector('[data-product-code]')?.getAttribute('data-product-code') || '';
-                        const code = rawCode.replace(/^P_/, '');
-                        const name = el.querySelector('.miglog-prod-name a, [data-product-name]')?.innerText?.trim() || el.querySelector('img')?.getAttribute('alt') || '';
-                        const qtyInput = el.querySelector('input[name=\"qty\"], .js-qty-selector-input, input');
-                        const qty = parseFloat(qtyInput ? qtyInput.value : '1') || 1.0;
-                        const entry = el.getAttribute('data-entry-number') || code;
-                        if (code && name) {
-                            items.push({
-                                line_id: String(entry),
-                                product_id: code,
-                                name: name,
-                                qty: qty,
-                                unit_price_ils: 0.0,
-                                line_total_ils: 0.0
-                            });
-                        }
-                    });
-                    
-                    return fetch('/online/he/cart/miniCart/TOTAL')
-                        .then(r => r.text())
-                        .then(t => {
-                            const m = t.match(/<span>\\s*([\\d.]+)\\s*<\\/span>/);
-                            const total = m ? parseFloat(m[1]) : 0.0;
-                            return { items, total };
-                        }).catch(() => ({ items, total: 0.0 }));
-                }''')
-                
-                items = cart_data.get("items", [])
-                subtotal = 0.0
-                for item in items:
-                    prod = await self._get_product_unlocked(item["product_id"])
-                    unit_price = float(prod.get("price_ils", 0.0)) if prod else 0.0
-                    item["unit_price_ils"] = unit_price
-                    item["line_total_ils"] = round(item["qty"] * unit_price, 2)
-                    subtotal += item["line_total_ils"]
-                
-                subtotal = round(subtotal, 2)
-                delivery_fee = 29.90 if items else 0.0
-                total = round(subtotal + delivery_fee, 2)
-                return {
-                    "items": items,
-                    "subtotal_ils": subtotal,
-                    "delivery_fee_ils": delivery_fee,
-                    "total_ils": total
-                }
-            except APIException:
-                raise
-            except Exception as e:
-                logger.warning(f"Error fetching live cart: {e}")
-                raise APIException(status_code=502, code="upstream_error", message="Could not read the live Shufersal cart.")
-
         if config.MOCK_MODE:
             return self._calculate_mock_cart()
-        return {
-            "items": [],
-            "subtotal_ils": 0.0,
-            "delivery_fee_ils": 0.0,
-            "total_ils": 0.0
-        }
+        return await self._read_cart()
+
     async def add_to_cart(self, product_id: str, qty: float = 1.0) -> Dict[str, Any]:
         async with self._lock:
             return await self._add_to_cart_unlocked(product_id, qty)
 
     async def _add_to_cart_unlocked(self, product_id: str, qty: float = 1.0) -> Dict[str, Any]:
-        await self._require_live()
-        if self.page and not config.MOCK_MODE:
-            try:
-                code_with_p = product_id if product_id.startswith("P_") else f"P_{product_id}"
-                search_url = f"{config.SHUFERSAL_BASE_URL.rstrip('/')}/online/he/search?text={product_id}"
-                await self.page.goto(search_url, wait_until="domcontentloaded", timeout=25000)
-                await self.page.wait_for_timeout(1500)
-                
-                clicked = await self.page.evaluate('''([code, pCode]) => {
-                    const tile = document.querySelector(`li[data-product-code="${code}"], li[data-product-code="${pCode}"]`);
-                    if (tile) {
-                        if (tile.classList.contains('miglog-incart')) {
-                            const plusBtn = tile.querySelector('button.bootstrap-touchspin-up, .btnTouchspin');
-                            if (plusBtn) {
-                                plusBtn.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
-                                return true;
-                            }
-                        }
-                        const btn = tile.querySelector('button.js-add-to-cart, button.miglog-btn-add, .js-add-to-cart');
-                        if (btn) {
-                            btn.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
-                            return true;
-                        }
-                    }
-                    const firstBtn = document.querySelector('button.js-add-to-cart, button.miglog-btn-add');
-                    if (firstBtn) {
-                        firstBtn.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
-                        return true;
-                    }
-                    return false;
-                }''', [product_id, code_with_p])
-                
-                if clicked:
-                    await self.page.wait_for_timeout(3000)
-                    return await self._get_cart_unlocked()
-            except Exception as e:
-                logger.warning(f"Live add_to_cart failed: {e}")
         if config.MOCK_MODE:
-            prod = await self._get_product_unlocked(product_id)
-            price = prod["price_ils"] if prod else 10.0
-            name = prod["name"] if prod else f"מוצר {product_id}"
+            prod = self._mock_product(product_id)
             line_id = f"line_{len(self._mock_cart) + 101}"
             self._mock_cart.append({
-                "line_id": line_id,
-                "product_id": product_id,
-                "name": name,
-                "qty": qty,
-                "unit_price_ils": price,
-                "line_total_ils": round(qty * price, 2)
+                "line_id": line_id, "product_id": product_id, "name": prod["name"], "qty": qty,
+                "unit_price_ils": prod["price_ils"], "line_total_ils": round(qty * prod["price_ils"], 2),
             })
             return self._calculate_mock_cart()
-        return await self._get_cart_unlocked()
+
+        product = await self._lookup_product(product_id)
+        if not product:
+            raise APIException(status_code=404, code="product_not_found",
+                               message=f"No product with code {clean_code(product_id)} exists on the site.")
+        before = await self._read_cart()
+        existing = self._line_for(before, product["id"])
+        if existing:
+            target = round(existing["qty"] + qty, 3)
+            await self._post_update(existing["line_id"], target, existing["selling_method"])
+        else:
+            target = qty
+            await self._post_add(product, qty)
+        after = await self._read_cart()
+        self._verify_qty(after, product["id"], target, "Add to cart")
+        return after
 
     async def update_cart_item(self, line_id: str, qty: float) -> Dict[str, Any]:
         async with self._lock:
             return await self._update_cart_item_unlocked(line_id, qty)
 
     async def _update_cart_item_unlocked(self, line_id: str, qty: float) -> Dict[str, Any]:
-        await self._require_live()
-        if not config.MOCK_MODE and self.page:
-            if qty <= 0:
-                return await self._delete_cart_item_unlocked(line_id)
-            try:
-                updated = await self.page.evaluate('''([lineId, newQty]) => {
-                    let item = document.querySelector(`article[data-entry-number="${lineId}"]`) ||
-                               document.querySelector(`article[data-product-code*="${lineId}"]`);
-                    if (!item) {
-                        const all = document.querySelectorAll('#cartMiddleContent .miglog-prod');
-                        const idx = parseInt(lineId);
-                        if (!isNaN(idx) && idx >= 0 && idx < all.length) item = all[idx];
-                    }
-                    if (item) {
-                        const input = item.querySelector('input[name="qty"], .js-qty-selector-input, input');
-                        if (input) {
-                            input.value = String(newQty);
-                            input.dispatchEvent(new Event('change', { bubbles: true }));
-                            const form = item.querySelector('form.add_to_cart_form, form[action*="update"]');
-                            if (form) form.dispatchEvent(new Event('submit', { bubbles: true }));
-                            return true;
-                        }
-                    }
-                    return false;
-                }''', [line_id, qty])
-                await self.page.wait_for_timeout(2000)
-                return await self._get_cart_unlocked()
-            except Exception as e:
-                logger.warning(f"Live update cart failed: {e}")
-
         if config.MOCK_MODE:
             if qty <= 0:
-                self._mock_cart = [item for item in self._mock_cart if item["line_id"] != line_id]
-                return self._calculate_mock_cart()
-
+                return await self._delete_cart_item_unlocked(line_id)
             existing = next((item for item in self._mock_cart if item["line_id"] == line_id), None)
             if not existing:
                 raise APIException(status_code=404, code="item_not_found", message=f"Cart item {line_id} not found")
-
             existing["qty"] = qty
             existing["line_total_ils"] = round(qty * existing["unit_price_ils"], 2)
             return self._calculate_mock_cart()
 
-        return await self._get_cart_unlocked()
+        if qty <= 0:
+            return await self._delete_cart_item_unlocked(line_id)
+        before = await self._read_cart()
+        entry = self._entry(before, line_id)
+        await self._post_update(entry["line_id"], qty, entry["selling_method"])
+        after = await self._read_cart()
+        self._verify_qty(after, entry["product_id"], qty, "Quantity update")
+        return after
 
     async def delete_cart_item(self, line_id: str) -> Dict[str, Any]:
         async with self._lock:
             return await self._delete_cart_item_unlocked(line_id)
 
     async def _delete_cart_item_unlocked(self, line_id: str) -> Dict[str, Any]:
-        await self._require_live()
-        if not config.MOCK_MODE and self.page:
-            try:
-                deleted = await self.page.evaluate('''([lineId]) => {
-                    let item = document.querySelector(`article[data-entry-number="${lineId}"]`) ||
-                               document.querySelector(`article[data-product-code*="${lineId}"]`);
-                    if (!item) {
-                        const all = document.querySelectorAll('#cartMiddleContent .miglog-prod');
-                        const idx = parseInt(lineId);
-                        if (!isNaN(idx) && idx >= 0 && idx < all.length) item = all[idx];
-                    }
-                    if (item) {
-                        const remover = item.querySelector('[data-miglog-role="cart-item-remover"], .miglog-prod-remove');
-                        if (remover) {
-                            remover.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
-                            return true;
-                        }
-                    }
-                    return false;
-                }''', [line_id])
-                if deleted:
-                    await self.page.wait_for_timeout(2500)
-                    return await self._get_cart_unlocked()
-                else:
-                    raise APIException(status_code=404, code="item_not_found", message=f"Cart item {line_id} not found on live page")
-            except APIException:
-                raise
-            except Exception as e:
-                logger.warning(f"Live delete cart item failed: {e}")
-
         if config.MOCK_MODE:
             orig_len = len(self._mock_cart)
             self._mock_cart = [item for item in self._mock_cart if item["line_id"] != line_id]
@@ -677,34 +561,34 @@ class ShufersalDriver:
                 raise APIException(status_code=404, code="item_not_found", message=f"Cart item {line_id} not found")
             return self._calculate_mock_cart()
 
-        return await self._get_cart_unlocked()
+        before = await self._read_cart()
+        entry = self._entry(before, line_id)
+        await self._post_update(entry["line_id"], 0, entry["selling_method"])
+        after = await self._read_cart()
+        self._verify_qty(after, entry["product_id"], 0.0, "Remove from cart")
+        return after
+
     async def clear_cart(self) -> Dict[str, Any]:
         async with self._lock:
             return await self._clear_cart_unlocked()
 
     async def _clear_cart_unlocked(self) -> Dict[str, Any]:
-        await self._require_live()
-        if self.page and not config.MOCK_MODE:
-            try:
-                await self.page.evaluate('''async () => {
-                    for (let i = 0; i < 20; i++) {
-                        const remover = document.querySelector('[data-miglog-role=\"cart-item-remover\"], .miglog-prod-remove');
-                        if (!remover) break;
-                        remover.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
-                        await new Promise(r => setTimeout(r, 1800));
-                    }
-                }''')
-            except Exception as e:
-                logger.warning(f"Error clearing live cart: {e}")
-
         if config.MOCK_MODE:
             self._mock_cart.clear()
-        return {
-            "items": [],
-            "subtotal_ils": 0.0,
-            "delivery_fee_ils": 0.0,
-            "total_ils": 0.0
-        }
+            return self._calculate_mock_cart()
+
+        cart = await self._read_cart()
+        passes = len(cart["items"]) + 2
+        for _ in range(passes):
+            if not cart["items"] and cart["item_count"] == 0:
+                return cart
+            # Highest entry number first so remaining entry numbers stay valid.
+            for entry in sorted(cart["items"], key=lambda i: int(i["line_id"]) if i["line_id"].isdigit() else 0, reverse=True):
+                await self._post_update(entry["line_id"], 0, entry["selling_method"])
+            cart = await self._read_cart()
+        if cart["items"] or cart["item_count"]:
+            raise _upstream(f"Cart still has {cart['item_count']} items after clearing.", code="cart_clear_incomplete")
+        return cart
 
     # ==================== Delivery & Payment ====================
 
@@ -713,47 +597,69 @@ class ShufersalDriver:
             return await self._get_delivery_slots_unlocked()
 
     async def _get_delivery_slots_unlocked(self) -> List[Dict[str, Any]]:
-        if not config.MOCK_MODE:
-            self._not_live_implemented("Delivery slot lookup")
-        today = datetime.now()
-        slots = []
-        for d in range(1, 4):
-            date_str = (today + timedelta(days=d)).strftime("%Y-%m-%d")
-            slots.append({
-                "id": f"slot_{date_str}_morning",
-                "date": date_str,
-                "window": "09:00 - 13:00",
-                "fee_ils": 29.90,
-                "available": True
-            })
-            slots.append({
-                "id": f"slot_{date_str}_evening",
-                "date": date_str,
-                "window": "17:00 - 21:00",
-                "fee_ils": 29.90,
-                "available": d != 2
-            })
-        return slots
+        if config.MOCK_MODE:
+            return self._mock_slots()
+        data = await self._fetch_json(f"{BASE}/timeSlot/preselection/getHomeDeliverySlots?amount=1.0")
+        try:
+            return parse_home_delivery_slots(data)
+        except ParseError as e:
+            raise _upstream(f"Unexpected delivery slot response: {e}")
 
     async def get_payment_method(self) -> Dict[str, Any]:
         async with self._lock:
-            return await self._get_payment_method_unlocked()
+            return public_payment(await self._get_payment_method_unlocked())
 
     async def _get_payment_method_unlocked(self) -> Dict[str, Any]:
-        if not config.MOCK_MODE:
-            self._not_live_implemented("Payment method lookup")
+        """Full masked record including the site's payment-info id (internal)."""
+        if config.MOCK_MODE:
+            return {"payment_info_id": "mock", "payment_type": "CREDIT_CARD", "brand": "Mastercard", "last4": "4242",
+                    "expiry_month": "12", "expiry_year": "2028", "name_on_card": "י. י."}
+        data = await self._fetch_json(f"{BASE}/checkout/payment/customer/paymentInfos")
+        try:
+            return parse_payment_method(data)
+        except ParseError as e:
+            raise APIException(status_code=404, code="payment_method_unavailable",
+                               message=f"No usable saved payment method: {e}")
+
+    # ==================== Mock helpers ====================
+
+    def _mock_product(self, product_id: str) -> Dict[str, Any]:
+        catalog = {
+            "P12345": {"id": "P12345", "name": "חלב תנובה 3% בקרטון 1 ליטר", "description": "חלב מפוסטר הומוגני 3% שומן מועשר בוויטמין D",
+                       "price_ils": 7.10, "sale_price_ils": None, "unit": "יחידה", "nutrition_url": None, "in_stock": True},
+            "P54321": {"id": "P54321", "name": "קוטג' תנובה 5% 250 גרם", "description": "גבינת קוטג' 5% שומן עשירה בחלבון",
+                       "price_ils": 6.50, "sale_price_ils": 5.90, "unit": "יחידה", "nutrition_url": None, "in_stock": True},
+        }
+        return dict(catalog.get(product_id) or {
+            "id": product_id, "name": f"מוצר {product_id}", "description": f"תיאור פריט {product_id}",
+            "price_ils": 10.0, "sale_price_ils": None, "unit": "יחידה", "nutrition_url": None, "in_stock": True,
+        })
+
+    def _calculate_mock_cart(self) -> Dict[str, Any]:
+        items = [dict(i, selling_method="BY_UNIT") for i in self._mock_cart]
+        subtotal = round(sum(round(i["qty"] * i["unit_price_ils"], 2) for i in items), 2)
         return {
-            "brand": "Mastercard",
-            "last4": "4242",
-            "expiry_month": "12",
-            "expiry_year": "2028",
-            "name_on_card": "ישראל ישראלי"
+            "items": items,
+            "item_count": len(items),
+            "subtotal_ils": subtotal,
+            "delivery_fee_ils": None,
+            "total_ils": subtotal,
+            "total_includes_delivery": False,
+            "prices_complete": True,
+            "cart_hash": cart_hash(items),
         }
 
-    async def get_live_total(self) -> float:
-        async with self._lock:
-            cart = await self._get_cart_unlocked()
-            return cart["total_ils"]
+    def _mock_slots(self) -> List[Dict[str, Any]]:
+        from datetime import datetime, timedelta
+        slots = []
+        for d in range(1, 4):
+            date_str = (datetime.now() + timedelta(days=d)).strftime("%Y-%m-%d")
+            for part, window in (("morning", "09:00 - 13:00"), ("evening", "17:00 - 21:00")):
+                slots.append({"id": f"slot_{date_str}_{part}", "date": date_str, "window": window,
+                              "fee_ils": self._mock_delivery_fee, "available": not (d == 2 and part == "evening")})
+        return slots
+
+    # ==================== Checkout ====================
 
     async def submit_order(
         self,
@@ -763,56 +669,22 @@ class ShufersalDriver:
         cvv: Optional[str] = None
     ) -> Dict[str, Any]:
         async with self._lock:
-            return await self._submit_order_unlocked(quote_id, confirm_total_ils, live_quote, cvv)
+            if not config.MOCK_MODE:
+                raise APIException(status_code=501, code="not_implemented",
+                                   message="Order submission is not implemented against the live site.")
+            cart = self._calculate_mock_cart()
+            live_total = round(cart["subtotal_ils"] + live_quote["delivery_fee_ils"], 2)
+            if round(confirm_total_ils, 2) != live_total or round(live_quote["total_ils"], 2) != live_total:
+                raise APIException(status_code=409, code="total_drift",
+                                   message="The live total differs from the confirmed quote.")
+            if not cvv:
+                raise APIException(status_code=400, code="cvv_required", message="CVV is not configured.")
+            return {"order_id": f"MOCK-{quote_id[-6:]}", "eta": live_quote["delivery_slot_id"], "total_ils": live_total}
 
-    async def _submit_order_unlocked(
-        self,
-        quote_id: str,
-        confirm_total_ils: float,
-        live_quote: Dict[str, Any],
-        cvv: Optional[str] = None
-    ) -> Dict[str, Any]:
-        if not config.MOCK_MODE:
-            # The order flow below fabricates an order id and clears the cart; it must
-            # never run against the real account.
-            self._not_live_implemented("Order submission")
-        cart = await self._get_cart_unlocked()
-        live_total = cart["total_ils"]
-        
-        # Total drift verification
-        if round(confirm_total_ils, 2) != round(live_total, 2):
-            raise APIException(
-                status_code=409,
-                code="total_drift",
-                message=f"Live site total ({live_total} ILS) does not match confirmed total ({confirm_total_ils} ILS)"
-            )
-        
-        if round(live_quote["total_ils"], 2) != round(live_total, 2):
-            raise APIException(
-                status_code=409,
-                code="total_drift",
-                message=f"Live site total ({live_total} ILS) has drifted from quote ({live_quote['total_ils']} ILS)"
-            )
+def _fmt_qty(qty: float) -> str:
+    q = float(qty)
+    return str(int(q)) if q.is_integer() else f"{q:.3f}".rstrip("0")
 
-        if not cvv:
-            raise APIException(
-                status_code=400,
-                code="cvv_required",
-                message="CVV is required by the payment gateway for this order"
-            )
-
-        # Order placed successfully
-        order_id = f"SHUF-{datetime.now().strftime('%y%m%d')}-{live_quote['delivery_slot_id'][-4:]}"
-        eta = "2026-09-20 12:00:00"
-        
-        # Clear cart post-order
-        await self._clear_cart_unlocked()
-
-        return {
-            "order_id": order_id,
-            "eta": eta,
-            "total_ils": live_total
-        }
 
 # Global driver singleton
 shufersal_driver = ShufersalDriver()
