@@ -55,6 +55,7 @@ class ShufersalDriver:
         self._live_error: Optional[str] = None
         self._last_live_attempt: float = 0.0
         self._last_launch_failed = False
+        self._headless = True
 
         # Internal mock store used only when MOCK_MODE=True (tests/demo).
         self._mock_logged_in = True
@@ -96,6 +97,7 @@ class ShufersalDriver:
             is_headless = config.HEADLESS if headless is None else headless
 
             logger.info(f"Launching persistent browser context from {profile_dir} (headless={is_headless})")
+            self._headless = bool(is_headless)
             self.context = await self.playwright.chromium.launch_persistent_context(
                 user_data_dir=profile_dir,
                 headless=is_headless,
@@ -780,6 +782,17 @@ class ShufersalDriver:
             "payment": public_payment(payment),
         }
 
+    CHECKOUT_STATE_JS = """() => {
+        const visible = (sel) => [...document.querySelectorAll(sel)].some(e => e.offsetParent !== null);
+        return {
+            path: location.pathname,
+            reauth: visible('.miglog-pwd-modal #j_password, #checkoutPwd, #smsCodeInput'),
+            cvv: !!document.querySelector('input[name*="cvv" i], input[id*="cvv" i], iframe[src*="payme" i]'),
+            threeDS: !!(window.miglog && window.miglog.threeDSecure && window.miglog.threeDSecure.enabled),
+            threeDSTest: !!(window.miglog && window.miglog.threeDSecure && window.miglog.threeDSecure.isTestMode),
+        };
+    }"""
+
     async def checkout(
         self,
         *,
@@ -787,15 +800,37 @@ class ShufersalDriver:
         expected_cart_hash: str,
         confirm_total_ils: float,
         place_order: bool,
-        cvv: Optional[str] = None,
+        watched: bool = False,
     ) -> Dict[str, Any]:
         async with self._lock:
-            return await self._checkout_unlocked(slot_id, expected_cart_hash, confirm_total_ils, place_order, cvv)
+            relaunched = False
+            if watched and not config.MOCK_MODE and self._headless:
+                # The persistent profile can be open in one browser only, so the
+                # checkout step relaunches it headed (same session) and reverts after.
+                await self._require_live()
+                if not await self._start_live(headless=False):
+                    raise APIException(status_code=503, code="browser_unavailable",
+                                       message="Could not open a visible browser window for the watched checkout.")
+                relaunched = True
+            try:
+                return await self._checkout_unlocked(slot_id, expected_cart_hash, confirm_total_ils, place_order, watched)
+            finally:
+                if relaunched:
+                    await self._start_live(headless=config.HEADLESS)
 
-    async def _checkout_unlocked(self, slot_id, expected_cart_hash, confirm_total_ils, place_order, cvv):
+    async def _page_state(self) -> Dict[str, Any]:
+        return await self.page.evaluate(self.CHECKOUT_STATE_JS)
+
+    async def _checkout_unlocked(self, slot_id, expected_cart_hash, confirm_total_ils, place_order, watched):
         """Walks checkout: verify cart -> select slot -> open checkout -> read the
-        site total -> (only if place_order) place the order. Never touches the
-        cart contents. place_order=False stops before the final step."""
+        site total, then
+          - place_order=False: stop (dry run);
+          - watched: hand over to Or in the visible window (he clears any
+            password/SMS step, the PayMe card field and 3-D Secure, and clicks the
+            site's own place-order button); the service waits for the confirmation
+            page and returns the order number it shows;
+          - otherwise: call the site's placeOrder itself (only with no blockers).
+        Never touches the cart contents."""
         summary = await self._checkout_summary_unlocked(slot_id)
         if summary["cart_hash"] != expected_cart_hash:
             raise APIException(status_code=409, code="cart_mismatch",
@@ -803,7 +838,7 @@ class ShufersalDriver:
 
         if config.MOCK_MODE:
             site_total = summary["estimated_total_ils"]
-            result = {"summary": summary, "site_total_ils": site_total, "blockers": [],
+            result = {"summary": summary, "site_total_ils": site_total, "blockers": [], "warnings": [],
                       "checks": {"reached_checkout": True, "three_ds_enabled": False, "cvv_field_present": False}}
             if abs(site_total - confirm_total_ils) > 0.01:
                 raise APIException(status_code=409, code="total_drift", message="The live total differs from the confirmed quote.")
@@ -812,6 +847,7 @@ class ShufersalDriver:
             return dict(result, status="placed", order_id=f"MOCK-{expected_cart_hash[:6]}")
 
         blockers: List[str] = []
+        warnings: List[str] = []
         # 1. Select the delivery slot on the cart (the site's own preselection call).
         status, _, text = await self._fetch(
             f"{BASE}/timeSlot/preselection/postHomeDeliverySlot",
@@ -826,16 +862,13 @@ class ShufersalDriver:
         try:
             await self.page.goto(config.SHUFERSAL_BASE_URL + BASE + "/checkout", wait_until="domcontentloaded", timeout=45000)
             await self.page.wait_for_timeout(4000)
-            page_state = await self.page.evaluate("""() => {
-                const visible = (sel) => [...document.querySelectorAll(sel)].some(e => e.offsetParent !== null);
-                return {
-                    path: location.pathname,
-                    reauth: visible('.miglog-pwd-modal #j_password, #checkoutPwd, #smsCodeInput'),
-                    cvv: !!document.querySelector('input[name*="cvv" i], input[id*="cvv" i], iframe[src*="payme" i]'),
-                    threeDS: !!(window.miglog && window.miglog.threeDSecure && window.miglog.threeDSecure.enabled),
-                    threeDSTest: !!(window.miglog && window.miglog.threeDSecure && window.miglog.threeDSecure.isTestMode),
-                };
-            }""")
+            page_state = await self._page_state()
+            if watched and page_state.get("reauth"):
+                # Or enters the password / SMS code in the visible window.
+                deadline = time.monotonic() + config.WATCH_TIMEOUT_SECONDS
+                while page_state.get("reauth") and time.monotonic() < deadline:
+                    await asyncio.sleep(config.WATCH_POLL_SECONDS)
+                    page_state = await self._page_state()
         except APIException:
             raise
         except Exception as e:
@@ -847,7 +880,8 @@ class ShufersalDriver:
         if page_state.get("reauth"):
             blockers.append("the site asks for the account password or an SMS code before checkout")
         if page_state.get("cvv"):
-            blockers.append("the checkout page shows a CVV / PayMe card field, which this service does not fill yet")
+            (warnings if watched else blockers).append(
+                "the checkout page shows a CVV / PayMe card field; the service never types card data")
 
         # 3. The site's own total for the order.
         site_total = None
@@ -859,7 +893,7 @@ class ShufersalDriver:
             except (APIException, ValueError):
                 site_total = None
         if site_total is None:
-            blockers.append("could not read the order total from the checkout page")
+            (warnings if watched else blockers).append("could not read the order total from the checkout page")
         elif abs(site_total - confirm_total_ils) > 0.01:
             raise APIException(status_code=409, code="total_drift",
                                message=f"The site total ({site_total} ILS) differs from confirm_total_ils.")
@@ -868,16 +902,20 @@ class ShufersalDriver:
             "summary": summary,
             "site_total_ils": site_total,
             "blockers": blockers,
+            "warnings": warnings,
             "checks": {"reached_checkout": reached, "three_ds_enabled": bool(page_state.get("threeDS")),
-                       "cvv_field_present": bool(page_state.get("cvv"))},
+                       "cvv_field_present": bool(page_state.get("cvv")), "watched": bool(watched)},
         }
         if not place_order:
             return dict(result, status="dry_run", order_id=None)
 
-        # ---------- Real order placement (only with confirm + fresh key + enabled flag) ----------
+        # ---------- Real order (confirm + fresh key + enabled flag checked by the API) ----------
         if blockers:
             raise APIException(status_code=409, code="checkout_blocked",
-                               message="Checkout cannot be completed automatically: " + "; ".join(blockers))
+                               message="Checkout cannot be completed: " + "; ".join(blockers))
+        if watched:
+            return dict(result, **(await self._await_handover()))
+
         jwt = ""
         if page_state.get("threeDS"):
             try:
@@ -912,6 +950,27 @@ class ShufersalDriver:
                                message=f"The site rejected the order ({outcome.get('code')}).")
         # The request went out but the answer is not understood: the order may exist.
         return dict(result, status="outcome_unknown", order_id=None)
+
+    async def _await_handover(self) -> Dict[str, Any]:
+        """Waits for Or to finish payment and click place-order in the visible
+        window, then reads the order number from the confirmation page."""
+        logger.info("Watched checkout: waiting for the place-order click in the visible browser.")
+        deadline = time.monotonic() + config.WATCH_TIMEOUT_SECONDS
+        looked_confirmed = False
+        while time.monotonic() < deadline:
+            if not self._is_alive():
+                return {"status": "outcome_unknown", "order_id": None}
+            try:
+                url = self.page.url
+                if re.search(r"confirm|thank", url, re.I) or parse_order_number(url, ""):
+                    looked_confirmed = True
+                    order_id = parse_order_number(url, await self.page.content())
+                    if order_id:
+                        return {"status": "placed", "order_id": order_id}
+            except Exception:
+                pass
+            await asyncio.sleep(config.WATCH_POLL_SECONDS)
+        return {"status": "placed_unconfirmed" if looked_confirmed else "handover_timeout", "order_id": None}
 
 
 def _fmt_qty(qty: float) -> str:

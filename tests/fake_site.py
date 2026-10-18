@@ -55,6 +55,9 @@ class FakeSite:
         self.orders_placed = 0
         self.fail_reads_after_write = 0  # the next N cart reads after a write fail (uncertain outcome)
         self.hidden_entries = set()      # entry numbers the cart page does not render
+        self.checkout_state_sequence = []  # page states returned before checkout_state (e.g. re-auth, then clear)
+        self.confirm_on_url_reads = None   # watched run: Or "clicks" place-order after N url reads
+        self.confirmation_url = BASE + "/online/he/checkout/orderConfirmation/987654321"
 
     # ---- helpers ----
     def _render_cart(self):
@@ -152,7 +155,21 @@ class FakePage:
         self.closed = False
         self.handlers = {}
         self.gotos = []
-        self.url = BASE + "/online/he/"
+        self._url = BASE + "/online/he/"
+
+    @property
+    def url(self):
+        n = self.site.confirm_on_url_reads
+        if n is not None and "/checkout" in self._url:
+            if n <= 0:
+                self._url = self.site.confirmation_url
+            else:
+                self.site.confirm_on_url_reads = n - 1
+        return self._url
+
+    @url.setter
+    def url(self, value):
+        self._url = value
 
     def is_closed(self):
         return self.closed
@@ -173,12 +190,14 @@ class FakePage:
         return None
 
     async def content(self):
-        return self.site.confirmation_html if "order" in self.url.lower() else "<html></html>"
+        return self.site.confirmation_html if "order" in self._url.lower() else "<html></html>"
 
     async def evaluate(self, script, args=None):
         if self.closed:
             raise Exception("Target page, context or browser has been closed")
         if args is None:  # checkout page state probe
+            if self.site.checkout_state_sequence:
+                return dict(self.site.checkout_state, **self.site.checkout_state_sequence.pop(0))
             return dict(self.site.checkout_state)
         if isinstance(args, bool):  # PayMe.clientData(isTestMode)
             return "payme-jwt"

@@ -145,6 +145,10 @@ class CheckoutSubmitRequest(BaseModel):
     expected_items: Optional[List[ExpectedItem]] = None
     dry_run: bool = True
     confirm: bool = False
+    # Watched run: the checkout opens in a visible browser window; Or handles any
+    # password/SMS, card and 3-D Secure step and clicks place-order himself; the
+    # service returns the order number from the confirmation page.
+    watched: bool = False
 
     @model_validator(mode="after")
     def require_expectation(self):
@@ -153,7 +157,7 @@ class CheckoutSubmitRequest(BaseModel):
         return self
 
 class CheckoutSubmitResponse(BaseModel):
-    status: str  # dry_run | placed | placed_unconfirmed | three_ds_required | outcome_unknown
+    status: str  # dry_run | placed | placed_unconfirmed | three_ds_required | outcome_unknown | handover_timeout
     dry_run: bool
     # The site's order number, parsed from its confirmation page; never invented.
     order_id: Optional[str] = None
@@ -162,6 +166,7 @@ class CheckoutSubmitResponse(BaseModel):
     summary: Dict[str, Any] = {}
     checks: Dict[str, Any] = {}
     blockers: List[str] = []
+    warnings: List[str] = []
 
 class FeedbackRequest(BaseModel):
     message: str

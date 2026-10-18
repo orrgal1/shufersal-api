@@ -170,23 +170,19 @@ def test_checkout_quote_and_submit_drift_protection(monkeypatch):
                       headers=AUTH_HEADERS)
     assert res.status_code == 200 and res.json()["status"] == "dry_run"
 
-    # Default is a dry run: no CVV, no key, no order id.
-    monkeypatch.setattr(config, "SHUFERSAL_CVV", "")
+    # Default is a dry run: no key, no order id.
     dry = client.post("/checkout/submit", json=base, headers=AUTH_HEADERS)
     assert dry.status_code == 200, dry.text
     assert dry.json()["status"] == "dry_run" and dry.json()["order_id"] is None
     assert checkout.await_args.kwargs["place_order"] is False
 
-    # A real order needs confirm=true and an Idempotency-Key, and a configured CVV.
+    # A real order needs confirm=true and an Idempotency-Key. No CVV is used:
+    # card entry happens in the site's PayMe frame, which the service never fills.
+    monkeypatch.setattr(config, "SHUFERSAL_CVV", "")
     calls = checkout.await_count
     assert client.post("/checkout/submit", json={**real, "confirm": False},
                        headers={**AUTH_HEADERS, "Idempotency-Key": "k0"}).json()["error"]["code"] == "confirmation_required"
     assert client.post("/checkout/submit", json=real, headers=AUTH_HEADERS).json()["error"]["code"] == "idempotency_key_required"
-    missing = client.post("/checkout/submit", json=real, headers={**AUTH_HEADERS, "Idempotency-Key": "k1"})
-    assert missing.status_code == 503 and missing.json()["error"]["code"] == "checkout_not_configured"
-    assert checkout.await_count == calls
-
-    monkeypatch.setattr(config, "SHUFERSAL_CVV", "042")
     # Caller supplied payment secrets are rejected without reflecting them.
     bad = client.post("/checkout/submit", json={**real, "cvv": "123"}, headers={**AUTH_HEADERS, "Idempotency-Key": "k2"})
     assert bad.status_code == 400 and "123" not in bad.text
@@ -207,8 +203,7 @@ def test_checkout_quote_and_submit_drift_protection(monkeypatch):
     ok = client.post("/checkout/submit", json=real, headers={**AUTH_HEADERS, "Idempotency-Key": "k4"})
     assert ok.status_code == 200, ok.text
     assert ok.json()["status"] == "placed" and ok.json()["order_id"].startswith("MOCK-")
-    assert "042" not in ok.text
-    assert checkout.await_args.kwargs["cvv"] == "042"
+    assert "cvv" not in checkout.await_args.kwargs
     calls = checkout.await_count
     replay = client.post("/checkout/submit", json=real, headers={**AUTH_HEADERS, "Idempotency-Key": "k4"})
     assert replay.status_code == 200 and replay.json() == ok.json()

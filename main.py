@@ -37,7 +37,7 @@ from shufersal_parsers import cart_hash
 from checkout_ledger import CheckoutLedger
 
 checkout_ledger = CheckoutLedger(config.CHECKOUT_LEDGER)
-FINAL_SUBMIT_STATES = {"placed", "placed_unconfirmed", "three_ds_required", "outcome_unknown"}
+FINAL_SUBMIT_STATES = {"placed", "placed_unconfirmed", "three_ds_required", "outcome_unknown", "handover_timeout"}
 SAFE_CHECKOUT_CODES = {
     "total_drift", "quote_expired_or_invalid", "cart_mismatch", "cart_empty", "slot_unavailable",
     "checkout_blocked", "confirmation_required", "idempotency_key_required", "idempotency_key_used",
@@ -350,15 +350,6 @@ async def submit_checkout(
         if not (config.LIVE_CHECKOUT_ENABLED or config.MOCK_MODE):
             raise APIException(status_code=403, code="live_checkout_disabled",
                                message="Live order placement is disabled on this service.")
-        # The payment secret is local to this service. Fail before touching the driver
-        # if it has not been configured or is malformed.
-        cvv = config.SHUFERSAL_CVV
-        if not (len(cvv) in (3, 4) and cvv.isascii() and cvv.isdecimal()):
-            raise APIException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                code="checkout_not_configured",
-                message="Checkout is not configured."
-            )
         previous = checkout_ledger.claim(idempotency_key, payload.quote_id)
         if previous is not None and previous["state"] == "quote_consumed":
             raise APIException(status_code=409, code="quote_consumed",
@@ -369,8 +360,6 @@ async def submit_checkout(
                 return JSONResponse(status_code=previous["http_status"], content=previous["result"])
             raise APIException(status_code=409, code="idempotency_key_used",
                                message=f"This Idempotency-Key was already used (state: {previous['state']}). Use a new key.")
-    else:
-        cvv = None
 
     try:
         result = await shufersal_driver.checkout(
@@ -378,7 +367,7 @@ async def submit_checkout(
             expected_cart_hash=expected_hash,
             confirm_total_ils=payload.confirm_total_ils,
             place_order=place_order,
-            cvv=cvv,
+            watched=payload.watched,
         )
     except APIException as exc:
         if place_order:
@@ -398,8 +387,9 @@ async def submit_checkout(
         summary=result["summary"],
         checks=result.get("checks") or {},
         blockers=result.get("blockers") or [],
+        warnings=result.get("warnings") or [],
     )
-    http_status = 202 if response.status in ("three_ds_required", "outcome_unknown", "placed_unconfirmed") else 200
+    http_status = 202 if response.status in ("three_ds_required", "outcome_unknown", "placed_unconfirmed", "handover_timeout") else 200
     body = response.model_dump()
     if place_order:
         checkout_ledger.finish(idempotency_key, response.status, http_status, body)

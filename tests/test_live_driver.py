@@ -475,3 +475,53 @@ def test_ledger_survives_restart(tmp_path):
     b = CheckoutLedger(path)  # a fresh process
     prev = b.claim("k", "q2")
     assert prev["state"] == "placed" and prev["result"] == {"order_id": "1"}
+
+
+# ==================== Watched checkout ====================
+
+@pytest.fixture
+def watch_fast(monkeypatch):
+    monkeypatch.setattr(config, "HEADLESS", True)
+    monkeypatch.setattr(config, "WATCH_POLL_SECONDS", 0)
+    monkeypatch.setattr(config, "WATCH_TIMEOUT_SECONDS", 5)
+
+
+def _real(q, **extra):
+    return {"quote_id": q["quote_id"], "confirm_total_ils": q["total_ils"], "expected_cart_hash": q["cart_hash"],
+            "dry_run": False, "confirm": True, **extra}
+
+
+def test_watched_run_opens_visible_browser_and_returns_or_s_order(live, client, site, armed, watch_fast):
+    _fill(site)
+    q = _quote(client)
+    site.checkout_state_sequence = [{"reauth": True}, {"reauth": True}]  # Or types the SMS code
+    site.checkout_state.update(cvv=True)  # PayMe card field: Or handles it
+    site.confirm_on_url_reads = 3          # ...then clicks place-order
+    res = client.post("/checkout/submit", json=_real(q, watched=True), headers={**AUTH, "Idempotency-Key": "watch-1"})
+    assert res.status_code == 200, res.text
+    body = res.json()
+    assert body["status"] == "placed" and body["order_id"] == "987654321"
+    assert body["blockers"] == [] and any("CVV" in w for w in body["warnings"])
+    assert site.orders_placed == 0  # the service did not place the order itself
+    assert [a["headless"] for a in live.attempts] == [True, False, True]  # visible for checkout, then back
+    assert live._headless is True
+
+
+def test_watched_run_timeout_burns_key_and_quote(live, client, site, armed, watch_fast, monkeypatch):
+    monkeypatch.setattr(config, "WATCH_TIMEOUT_SECONDS", 0.05)
+    _fill(site)
+    q = _quote(client)
+    res = client.post("/checkout/submit", json=_real(q, watched=True), headers={**AUTH, "Idempotency-Key": "watch-2"})
+    assert res.status_code == 202 and res.json()["status"] == "handover_timeout" and res.json()["order_id"] is None
+    again = client.post("/checkout/submit", json=_real(q, watched=True), headers={**AUTH, "Idempotency-Key": "watch-3"})
+    assert again.json()["error"]["code"] == "quote_consumed"
+    assert live._headless is True
+
+
+def test_watched_dry_run_does_not_wait_or_place(live, client, site, watch_fast):
+    _fill(site)
+    q = _quote(client)
+    site.confirm_on_url_reads = 0
+    res = client.post("/checkout/submit", json={**_real(q, watched=True), "dry_run": True, "confirm": False}, headers=AUTH)
+    assert res.status_code == 200 and res.json()["status"] == "dry_run"
+    assert site.orders_placed == 0
