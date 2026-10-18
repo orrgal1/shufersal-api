@@ -354,6 +354,9 @@ async def submit_checkout(
         if previous is not None and previous["state"] == "quote_consumed":
             raise APIException(status_code=409, code="quote_consumed",
                                message="This quote already had a placement attempt. Get a new quote and check the cart.")
+        if previous is not None and previous.get("quote_id") != payload.quote_id:
+            raise APIException(status_code=409, code="idempotency_key_used",
+                               message="This Idempotency-Key was already used for another quote. Use a new key.")
         if previous is not None:
             if previous["state"] in FINAL_SUBMIT_STATES and previous["result"]:
                 log_mutation("POST", "/checkout/submit", previous["http_status"], None, {"replayed": True})

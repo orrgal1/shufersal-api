@@ -230,14 +230,25 @@ def public_payment(method: Dict[str, Any]) -> Dict[str, Any]:
 
 # ==================== Order ====================
 
-ORDER_URL_RE = re.compile(r"/(?:checkout/)?order(?:Confirmation|-confirmation|confirmation)?/(\d{5,})", re.I)
+# The site's order confirmation page (Hybris: /checkout/orderConfirmation/<code>).
+CONFIRMATION_PATH_RE = re.compile(r"/order-?confirmation(?:/(\d{5,}))?/?$", re.I)
 ORDER_TEXT_RE = re.compile(r"מספר\s*(?:ה)?הזמנה[^\d]{0,60}(\d{5,})")
 
 
+def is_confirmation_url(url: str) -> bool:
+    path = re.sub(r"^https?://[^/]+", "", url or "").split("?")[0].split("#")[0]
+    return bool(CONFIRMATION_PATH_RE.search(path))
+
+
 def parse_order_number(url: str, html: str) -> Optional[str]:
-    """Order number from the confirmation redirect URL or page; None when absent."""
-    m = ORDER_URL_RE.search(url or "")
-    if m:
+    """Order number from the confirmation page only: its URL segment, or the
+    "מספר הזמנה" text on it. Any other page (order history, an order-update
+    page, a page that merely says "thanks") yields None."""
+    if not is_confirmation_url(url):
+        return None
+    path = re.sub(r"^https?://[^/]+", "", url).split("?")[0].split("#")[0]
+    m = CONFIRMATION_PATH_RE.search(path)
+    if m and m.group(1):
         return m.group(1)
     text = re.sub(r"<[^>]+>", " ", html or "")
     m = ORDER_TEXT_RE.search(text)

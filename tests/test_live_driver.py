@@ -600,3 +600,37 @@ def test_watched_run_blocks_when_total_is_unreadable(live, client, site, armed, 
     assert any("order total" in b for b in dry.json()["blockers"])
     res = client.post("/checkout/submit", json=_real(q, watched=True), headers={**AUTH, "Idempotency-Key": "watch-total"})
     assert res.status_code == 409 and res.json()["error"]["code"] == "checkout_blocked"
+
+
+def test_old_key_with_new_quote_is_refused_not_replayed(live, client, site, armed):
+    _fill(site)
+    q1 = _quote(client)
+    first = client.post("/checkout/submit", json=_real(q1), headers={**AUTH, "Idempotency-Key": "reuse-1"})
+    assert first.json()["status"] == "placed"
+    q2 = _quote(client)
+    res = client.post("/checkout/submit", json=_real(q2), headers={**AUTH, "Idempotency-Key": "reuse-1"})
+    assert res.status_code == 409 and res.json()["error"]["code"] == "idempotency_key_used"
+    assert site.orders_placed == 1
+
+
+@pytest.mark.parametrize("url,html,expected", [
+    ("https://www.shufersal.co.il/online/he/checkout/orderConfirmation/123456789", "", "123456789"),
+    ("/online/he/checkout/orderConfirmation", "<p>מספר הזמנה: 55512345</p>", "55512345"),
+    ("/online/he/checkout/confirm-address", "<p>מספר הזמנה: 55512345</p>", None),
+    ("/online/he/thank-you", "<p>מספר הזמנה: 55512345</p>", None),
+    ("/online/he/my-account/order/12345678/update", "<p>מספר הזמנה: 12345678</p>", None),
+    ("/online/he/orders", "<p>מספר הזמנה 12345678</p>", None),
+])
+def test_order_number_only_from_confirmation_page(url, html, expected):
+    from shufersal_parsers import parse_order_number
+    assert parse_order_number(url, html) == expected
+
+
+def test_watched_handover_ignores_non_confirmation_pages(live, client, site, armed, watch_fast, monkeypatch):
+    monkeypatch.setattr(config, "WATCH_TIMEOUT_SECONDS", 0.05)
+    _fill(site)
+    q = _quote(client)
+    site.confirmation_url = "https://www.shufersal.co.il/online/he/checkout/confirm-delivery"
+    site.confirm_on_url_reads = 0
+    res = client.post("/checkout/submit", json=_real(q, watched=True), headers={**AUTH, "Idempotency-Key": "watch-nc"})
+    assert res.json()["status"] == "handover_timeout" and res.json()["order_id"] is None

@@ -16,6 +16,7 @@ from shufersal_parsers import (
     clean_code,
     extract_site_total,
     find_exact,
+    is_confirmation_url,
     parse_cart_entries,
     parse_home_delivery_slots,
     parse_minicart,
@@ -981,7 +982,7 @@ class ShufersalDriver:
                 return {"status": "outcome_unknown", "order_id": None}
             try:
                 url = self.page.url
-                if re.search(r"confirm|thank", url, re.I) or parse_order_number(url, ""):
+                if is_confirmation_url(url):
                     looked_confirmed = True
                     order_id = parse_order_number(url, await self.page.content())
                     if order_id:
