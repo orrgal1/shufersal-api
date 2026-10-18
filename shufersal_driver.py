@@ -911,7 +911,8 @@ class ShufersalDriver:
             except (APIException, ValueError):
                 site_total = None
         if site_total is None:
-            (warnings if watched else blockers).append("could not read the order total from the checkout page")
+            # Blocks watched runs too: the total must be checked by the service, not only by eye.
+            blockers.append("could not read the order total from the checkout page")
         elif abs(site_total - confirm_total_ils) > 0.01:
             raise APIException(status_code=409, code="total_drift",
                                message=f"The site total ({site_total} ILS) differs from confirm_total_ils.")

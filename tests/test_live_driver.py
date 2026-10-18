@@ -589,3 +589,14 @@ def test_failed_visible_relaunch_restores_headless_and_clears_flag(live, client,
     assert res.status_code == 503
     assert live._checkout_active is False and live._is_alive()
     assert client.get("/cart", headers=AUTH).status_code == 200
+
+
+def test_watched_run_blocks_when_total_is_unreadable(live, client, site, armed, watch_fast):
+    _fill(site)
+    q = _quote(client)
+    site.cost_summary = {"entries": [{"totalPrice": {"value": 1}}]}
+    site.confirm_on_url_reads = 0
+    dry = client.post("/checkout/submit", json={**_real(q, watched=True), "dry_run": True, "confirm": False}, headers=AUTH)
+    assert any("order total" in b for b in dry.json()["blockers"])
+    res = client.post("/checkout/submit", json=_real(q, watched=True), headers={**AUTH, "Idempotency-Key": "watch-total"})
+    assert res.status_code == 409 and res.json()["error"]["code"] == "checkout_blocked"
