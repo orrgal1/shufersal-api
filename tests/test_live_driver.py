@@ -689,3 +689,110 @@ def test_search_prices_come_from_the_search_json():
 def test_search_api_returns_prices(live, client):
     res = client.get("/search?q=522319", headers=AUTH).json()["results"]
     assert res[0]["price_ils"] == 7.35 and res[0]["selling_method"] == "BY_UNIT"
+
+
+# ==================== Cart count: units + grams (live 2026-10-19) ====================
+
+def _or_basket(site, monkeypatch):
+    """The shape of the real 18-line basket of 2026-10-19: 20 units over 14 unit
+    lines (one at qty 2, one at 6), weighed lines of 1 kg, 1 kg and 0.5 kg, and
+    one 1.3 kg package. The site's miniCartCount read 3820 = 20 + 2500 g + 1300 g."""
+    import tests.fake_site as fs
+    monkeypatch.setitem(fs.CATALOG, "46", {"name": "מלפפון", "price": 8.9, "selling": "BY_WEIGHT"})
+    extras = [f"90000{n:02d}" for n in range(11)]
+    for code in extras:
+        monkeypatch.setitem(fs.CATALOG, code, {"name": f"מוצר {code}", "price": 10.0, "selling": "BY_UNIT"})
+    lines = [("4131074", 2.0), ("522319", 6.0), ("7296073746423", 1.0)] + [(c, 1.0) for c in extras] \
+        + [("7296073754848", 1.0), ("46", 1.0), ("8000001", 1.0), ("749", 0.5)]
+    for n, (code, qty) in enumerate(lines):
+        site.cart.append({"entry": n, "code": code, "qty": qty})
+    return lines
+
+
+def test_weighed_and_packaged_lines_count_grams_and_cart_is_complete(live, client, site, monkeypatch):
+    lines = _or_basket(site, monkeypatch)
+    cart = client.get("/cart", headers=AUTH).json()
+    assert cart["item_count"] == 3820
+    assert len(cart["items"]) == len(lines) == 18
+    assert cart["lines_complete"] is True
+    methods = {i["product_id"]: i["selling_method"] for i in cart["items"]}
+    assert methods["749"] == "BY_WEIGHT" and methods["8000001"] == "BY_WEIGHT" and methods["46"] == "BY_WEIGHT"
+    assert methods["7296073754848"] == "BY_PACKAGE"
+    assert methods["4131074"] == "BY_UNIT"
+    assert next(i for i in cart["items"] if i["product_id"] == "749")["qty"] == 0.5
+
+
+@pytest.mark.parametrize("hidden", [0, 1, 14, 15, 17])  # qty-2 unit line, qty-6 unit line, package, weighed lines
+def test_cart_with_a_hidden_line_is_incomplete(live, client, site, monkeypatch, hidden):
+    _or_basket(site, monkeypatch)
+    site.hidden_entries = {hidden}
+    assert client.get("/cart", headers=AUTH).json()["lines_complete"] is False
+    res = client.post("/checkout/quote?delivery_slot_id=148340770", headers=AUTH)
+    assert res.status_code == 409 and res.json()["error"]["code"] == "cart_incomplete"
+
+
+def test_package_cart_without_page_line_count_fails_closed(live, client, site, monkeypatch):
+    _or_basket(site, monkeypatch)
+    original = site._render_cart
+    site._render_cart = lambda: original().split('<span class="totalItems">')[0]
+    # A package's grams are not on the page, so the count alone cannot prove completeness.
+    assert client.get("/cart", headers=AUTH).json()["lines_complete"] is False
+
+
+def test_unit_and_weight_cart_is_checked_exactly_without_page_line_count(live, client, site):
+    site.cart.append({"entry": 0, "code": "522319", "qty": 2.0})
+    site.cart.append({"entry": 1, "code": "749", "qty": 0.5})
+    original_cart, original_count = site._render_cart, site._minicart
+    site._render_cart = lambda: original_cart().split('<span class="totalItems">')[0]
+    assert client.get("/cart", headers=AUTH).json()["lines_complete"] is True  # 2 + 500 g == 502
+    site._minicart = lambda: original_count().replace('"miniCartCount": 502', '"miniCartCount": 503')
+    assert client.get("/cart", headers=AUTH).json()["lines_complete"] is False
+
+
+def test_cart_count_check_matrix():
+    from shufersal_parsers import cart_count_check
+    unit = {"qty": 2.0, "selling_method": "BY_UNIT"}
+    kg = {"qty": 0.5, "selling_method": "BY_WEIGHT"}
+    pkg = {"qty": 1.0, "selling_method": "BY_PACKAGE"}
+    assert cart_count_check(502, [unit, kg]) is True
+    assert cart_count_check(3, [unit, kg]) is False          # the old "weighed line counts once" reading
+    assert cart_count_check(502, [unit, kg], site_lines=3) is False
+    assert cart_count_check(1802, [unit, kg, pkg], site_lines=3) is True
+    assert cart_count_check(1802, [unit, kg, pkg], site_lines=None) is False
+    assert cart_count_check(502, [unit, kg, pkg], site_lines=3) is False  # nothing left for the package
+
+
+def test_cart_selling_method_from_live_markup():
+    from shufersal_parsers import parse_cart_entries, parse_cart_line_count
+    html = """
+    <article class="miglog-prod miglog-sellingmethod-by_weight miglog-customer-sellingmethod-by_weight miglog-incart"
+             data-medicine="false" data-product-code="P_749" data-entry-number="4" data-entry-qty="0.5">
+      <a class="miglog-prod-remove" data-miglog-role="cart-item-remover" data-selling-method=""></a>
+      <h3 class="miglog-text3 miglog-prod-name"><a title="פלפל">פלפל שישקה מתוק</a></h3>
+      <form class="add_to_cart_form" action="cart/update">
+        <input type="hidden" name="productCodePost" value="P_749"/>
+        <input class="spinContainer js-qty-selector-input" data-inc="0.5" data-miglog-sellingmethod="BY_WEIGHT"
+               type="text" value="0.50" name="qty"/>
+        <select class="selectpicker" name="sellingMethod" data-select-method="CUSTOMER_SELECTION">
+          <option value="BY_UNIT">יחידות</option><option selected value="BY_WEIGHT">ק"ג</option>
+        </select>
+      </form>
+    </article>
+    <article class="miglog-prod miglog-sellingmethod-by_package miglog-customer-sellingmethod-by_package miglog-incart"
+             data-product-code="P_7296073754848" data-entry-number="3" data-entry-qty="1.0">
+      <input class="js-qty-selector-input" data-miglog-sellingmethod="BY_PACKAGE" value="1.0" name="qty"/>
+      <select name="sellingMethod"><option value="BY_UNIT">u</option><option value="BY_WEIGHT">kg</option></select>
+    </article>
+    <article class="miglog-prod miglog-incart miglog-prod  miglog-cart-prod-"
+             data-product-code="P_5203819014205" data-entry-number="13" data-entry-qty="1.0">
+      <input class="js-qty-selector-input" data-miglog-sellingmethod="BY_UNIT" value="1" name="qty"/>
+      <input class="selectpicker" name="sellingMethod" value="BY_UNIT">
+    </article>
+    <span class="totalItems">(<span class="miglog-cart-summary-itemnum">3</span> פריטים)</span>
+    """
+    entries = {e["line_id"]: e for e in parse_cart_entries(html)}
+    assert entries["4"]["selling_method"] == "BY_WEIGHT" and entries["4"]["qty"] == 0.5
+    assert entries["3"]["selling_method"] == "BY_PACKAGE"
+    assert entries["13"]["selling_method"] == "BY_UNIT"
+    assert parse_cart_line_count(html) == 3
+    assert parse_cart_line_count("<div>no summary</div>") is None

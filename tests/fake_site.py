@@ -17,6 +17,9 @@ CATALOG = {
     "7296073746423": {"name": "טבליות למדיח", "price": 39.9, "selling": "BY_UNIT"},
     "4131074": {"name": "חלב 1%", "price": 6.2, "selling": "BY_UNIT"},
     "8000001": {"name": "עגבניות", "price": 9.9, "selling": "BY_WEIGHT"},
+    "749": {"name": "פלפל שישקה מתוק", "price": 14.9, "selling": "BY_WEIGHT"},
+    # Sold per package; the site counts the package's grams (live 2026-10-19: 1.3 kg carrots).
+    "7296073754848": {"name": "גזר ארוז", "price": 4.9, "selling": "BY_PACKAGE", "package_g": 1300},
 }
 
 # Two real-shaped slots (epoch ms, Asia/Jerusalem = UTC+3 in October).
@@ -77,20 +80,41 @@ class FakeSite:
             if e["entry"] in self.hidden_entries:
                 continue
             p = CATALOG[e["code"]]
+            sm = p["selling"]
+            # Live markup (2026-10-19): the method is on the article class and the
+            # qty input, the line's choice is the selected <option>; the remover's
+            # data-selling-method is empty and there is no hidden sellingMethod input.
+            options = "".join(f'<option {"selected " if v == sm else ""}value="{v}">{v}</option>'
+                              for v in ("BY_UNIT", "BY_WEIGHT"))
             rows.append(
-                f'<div class="miglog-prod miglog-sellingmethod-{p["selling"].lower()}" data-entry-number="{e["entry"]}" '
-                f'data-product-code="P_{e["code"]}" data-product-name="{escape(p["name"])}">'
-                f'<form class="addToCart"><input type="hidden" name="sellingMethod" value="{p["selling"]}">'
-                f'<input name="qty" class="js-qty-selector-input" value="{e["qty"]:g}"></form>'
-                f'<button data-miglog-role="cart-item-remover"></button></div>'
+                f'<article class="miglog-prod miglog-sellingmethod-{sm.lower()} miglog-customer-sellingmethod-{sm.lower()} miglog-incart" '
+                f'data-product-code="P_{e["code"]}" data-entry-number="{e["entry"]}" data-entry-qty="{e["qty"]:.1f}">'
+                f'<a class="miglog-prod-remove" data-miglog-role="cart-item-remover" data-selling-method=""></a>'
+                f'<h3 class="miglog-text3 miglog-prod-name"><a title="{escape(p["name"])}">{escape(p["name"])}</a></h3>'
+                f'<form class="add_to_cart_form" action="cart/update">'
+                f'<input type="hidden" name="productCodePost" value="P_{e["code"]}"/>'
+                f'<input class="spinContainer js-qty-selector-input" data-miglog-sellingmethod="{sm}" type="text" '
+                f'value="{e["qty"]:g}" name="qty"/>'
+                f'<select class="selectpicker" name="sellingMethod">{options}</select></form>'
+                f'<button data-miglog-role="cart-item-remover"></button></article>'
             )
+        summary = ('<span class="totalItems">(<span class="miglog-cart-summary-itemnum">%d</span> פריטים)</span>'
+                   % len(self.cart))  # server-side: counts every entry, rendered or not
         return ('<section id="cartMiddleContent"><div class="miglog-prodlist">' + "".join(rows)
-                + "</div></section><div class='recs'>" + "".join(tiles) + "</div>")
+                + "</div></section><div class='recs'>" + "".join(tiles) + "</div>" + summary)
 
     def _minicart(self):
         total = sum(CATALOG[e["code"]]["price"] * e["qty"] for e in self.cart)
-        # Like the live site: the count is units (weighed lines count once).
-        units = sum(e["qty"] if CATALOG[e["code"]]["selling"] == "BY_UNIT" else 1 for e in self.cart)
+        # Like the live site: BY_UNIT lines count their quantity, weighed and
+        # packaged lines count grams.
+        def contribution(e):
+            p = CATALOG[e["code"]]
+            if p["selling"] == "BY_UNIT":
+                return e["qty"]
+            if p["selling"] == "BY_PACKAGE":
+                return e["qty"] * p["package_g"]
+            return e["qty"] * 1000
+        units = sum(contribution(e) for e in self.cart)
         return ('\n\n{"miniCartCount": %d, "miniCartPrice": "<span>%.2f</span><span class="currency">'
                 '<span aria-hidden="true">₪</span></span>\n\t\t"}' % (round(units), total))
 

@@ -11,6 +11,7 @@ import config
 from security import APIException
 from shufersal_parsers import (
     ParseError,
+    cart_count_check,
     cart_hash,
     classify_place_order,
     clean_code,
@@ -18,6 +19,7 @@ from shufersal_parsers import (
     find_exact,
     is_confirmation_url,
     parse_cart_entries,
+    parse_cart_line_count,
     parse_home_delivery_slots,
     parse_minicart,
     parse_order_number,
@@ -485,11 +487,10 @@ class ShufersalDriver:
                 "unit_price_ils": unit,
                 "line_total_ils": round(unit * e["qty"], 2) if unit is not None else None,
             })
-        # miniCartCount is the site's own field and counts UNITS (verified live
-        # 2026-10-18: one line at qty 2 reads 2). Weighed lines are assumed to
-        # count once each. Any disagreement means the page hid lines.
-        units = sum(i["qty"] if i["selling_method"] == "BY_UNIT" else 1 for i in items)
-        lines_complete = abs(count - units) < QTY_TOLERANCE
+        # miniCartCount counts BY_UNIT quantities plus the GRAMS of weighed and
+        # packaged lines (verified live 2026-10-19, see parse_minicart). Any
+        # disagreement with the parsed lines means the page hid lines.
+        lines_complete = cart_count_check(count, items, parse_cart_line_count(html), QTY_TOLERANCE)
         return {
             "items": items,
             "item_count": count,

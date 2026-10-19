@@ -83,6 +83,13 @@ def find_exact(items: List[Dict[str, Any]], product_id: str) -> Optional[Dict[st
 
 # ==================== Cart ====================
 
+def _class_method(classes: List[str], prefix: str) -> Optional[str]:
+    for c in classes:
+        if c.startswith(prefix) and len(c) > len(prefix):
+            return c[len(prefix):].upper()
+    return None
+
+
 class _CartEntryParser(HTMLParser):
     def __init__(self):
         super().__init__(convert_charrefs=True)
@@ -90,6 +97,7 @@ class _CartEntryParser(HTMLParser):
         self._cur: Optional[Dict[str, Any]] = None
         self._depth = 0
         self._name_capture = False
+        self._in_sm_select = False
 
     def handle_starttag(self, tag, attrs):
         a = {k: (v or "") for k, v in attrs}
@@ -101,20 +109,33 @@ class _CartEntryParser(HTMLParser):
                     "line_id": entry,
                     "product_id": clean_code(a.get("data-product-code")),
                     "name": a.get("data-product-name", "").strip(),
-                    "selling_method": (a.get("data-selling-method") or "").upper() or None,
+                    "selling_method": None,
                     "unit_price_attr": _num(a.get("data-product-price")),
                     "qty": None,
+                    # Candidate selling methods by source, resolved in _finish().
+                    "_sm": {
+                        "customer_class": _class_method(classes, "miglog-customer-sellingmethod-"),
+                        "class": _class_method(classes, "miglog-sellingmethod-"),
+                        "attr": (a.get("data-selling-method") or "").upper() or None,
+                    },
                 }
                 self._depth = 0 if tag in VOID_TAGS else 1
+                self._in_sm_select = False
             return
         if tag not in VOID_TAGS:
             self._depth += 1
+        sm = self._cur["_sm"]
         if tag == "input":
             name = a.get("name", "")
             if name == "qty" and self._cur["qty"] is None:
                 self._cur["qty"] = _num(a.get("value"))
-            elif name == "sellingMethod" and not self._cur["selling_method"]:
-                self._cur["selling_method"] = a.get("value", "").upper() or None
+                sm.setdefault("qty_input", (a.get("data-miglog-sellingmethod") or "").upper() or None)
+            elif name == "sellingMethod":
+                sm.setdefault("input", a.get("value", "").upper() or None)
+        elif tag == "select" and a.get("name") == "sellingMethod":
+            self._in_sm_select = True
+        elif tag == "option" and self._in_sm_select and "selected" in a:
+            sm.setdefault("selected_option", a.get("value", "").upper() or None)
         if not self._cur["name"] and "miglog-prod-name" in classes:
             self._name_capture = True
 
@@ -126,8 +147,19 @@ class _CartEntryParser(HTMLParser):
     def handle_endtag(self, tag):
         if self._cur is None or tag in VOID_TAGS:
             return
+        if tag == "select":
+            self._in_sm_select = False
         self._depth -= 1
         if self._depth <= 0:
+            sm = self._cur.pop("_sm")
+            # The live cart (2026-10-19) marks the line's method on the article
+            # class (miglog-customer-sellingmethod-by_weight is the customer's
+            # choice for CUSTOMER_SELECTION products), on the qty input
+            # (data-miglog-sellingmethod) and as a <select> option; the article's
+            # data-selling-method and the remover's are empty.
+            self._cur["selling_method"] = next(
+                (sm.get(k) for k in ("customer_class", "class", "qty_input", "selected_option", "input", "attr")
+                 if sm.get(k)), None)
             self.entries.append(self._cur)
             self._cur = None
             self._name_capture = False
@@ -151,8 +183,20 @@ def parse_cart_entries(html: str) -> List[Dict[str, Any]]:
     return out
 
 
+def parse_cart_line_count(html: str) -> Optional[int]:
+    """The cart page's own line count ("(18 פריטים)" in the summary), rendered
+    server-side from the cart's entries. None when the page does not show it."""
+    m = re.search(r'class="[^"]*\bmiglog-cart-summary-itemnum\b[^"]*"[^>]*>\s*(\d+)\s*<', html or "")
+    return int(m.group(1)) if m else None
+
+
 def parse_minicart(text: Any) -> Tuple[int, float]:
     """/online/he/cart/miniCart/TOTAL -> (item count, site subtotal).
+
+    The count is not a unit count: BY_UNIT lines add their quantity, while
+    BY_WEIGHT and BY_PACKAGE lines add GRAMS (verified live 2026-10-19: 20 units
+    + 1 kg + 1 kg + 0.5 kg + a 1.3 kg carrot package read 3820). See
+    cart_count_check().
 
     The site labels this JSON but embeds unescaped HTML, so it is read with
     patterns rather than json.loads."""
@@ -164,6 +208,34 @@ def parse_minicart(text: Any) -> Tuple[int, float]:
     if not count or not price:
         raise ParseError("minicart response has no count or price")
     return int(count.group(1)), float(price.group(1).replace(",", ""))
+
+
+def cart_count_check(site_count: int, items: List[Dict[str, Any]],
+                     site_lines: Optional[int] = None, tolerance: float = 0.001) -> bool:
+    """True when the parsed lines account for the mini-cart count.
+
+    miniCartCount = sum(qty of BY_UNIT lines) + grams of every BY_WEIGHT and
+    BY_PACKAGE line. Weighed lines contribute qty_kg * 1000; a package's weight
+    is not on the cart page, so package lines only bound the remainder from
+    below and the page's own line count must then match the parsed lines."""
+    known = 0.0
+    unknown_min = 0.0  # lines whose count contribution is not readable (packages, unknown methods)
+    for i in items:
+        method = (i.get("selling_method") or "BY_UNIT").upper()
+        qty = float(i["qty"])
+        if method == "BY_UNIT":
+            known += qty
+        elif method == "BY_WEIGHT":
+            known += round(qty * 1000)
+        else:
+            unknown_min += max(qty, 1.0)  # at least a gram per package
+    if site_lines is not None and site_lines != len(items):
+        return False
+    remainder = site_count - known
+    if unknown_min == 0:
+        return abs(remainder) < tolerance
+    # A package's grams can hide a missing unit line, so require the page's line count too.
+    return site_lines is not None and remainder >= unknown_min - tolerance
 
 
 def cart_hash(items: List[Dict[str, Any]]) -> str:
