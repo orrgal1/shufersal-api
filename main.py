@@ -105,10 +105,11 @@ async def generic_exception_handler(request: Request, exc: Exception):
 
 @app.get("/health", response_model=HealthResponse)
 async def get_health():
-    """GET /health -> {status:'ok', logged_in:bool, cart_size:int}"""
+    """GET /health -> {status:'ok'|'logged_out', logged_in:bool, cart_size:int|null}.
+    cart_size is null (never 0) when the site session is not logged in."""
     logged_in, cart_size = await shufersal_driver.check_login_status()
     return HealthResponse(
-        status="ok",
+        status="ok" if logged_in else "logged_out",
         logged_in=logged_in,
         cart_size=cart_size
     )

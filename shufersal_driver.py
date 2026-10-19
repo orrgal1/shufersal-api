@@ -34,6 +34,11 @@ logger = logging.getLogger("shufersal_driver")
 BASE = "/online/he"
 CART_CONTEXT = urlencode({"cartContext[openFrom]": "CATALOG", "cartContext[recommendationType]": "REGULAR"})
 QTY_TOLERANCE = 0.001
+SESSION_COOKIE = "JSESSIONID"
+# Set by every site page when it renders: window.miglog.account.anonymous is
+# false for a logged-in customer and true for a guest (verified live 2026-10-19).
+LOGIN_MARKER_JS = ("() => { const a = window.miglog && window.miglog.account; "
+                   "return a && typeof a.anonymous === 'boolean' ? !a.anonymous : null; }")
 
 
 class _WriteRejected(APIException):
@@ -57,6 +62,10 @@ class ShufersalDriver:
     by re-reading the cart; nothing falls back to fixture data outside MOCK_MODE.
     """
     LIVE_RETRY_SECONDS = 60
+    # An empty cart read is only believed from a page loaded (and checked
+    # logged in) this recently in the same session; otherwise the page is
+    # reloaded and the cart read again first.
+    FRESH_PAGE_SECONDS = 120
 
     def __init__(self):
         self.playwright = None
@@ -71,6 +80,11 @@ class ShufersalDriver:
         self._last_launch_failed = False
         self._headless = True
         self._checkout_active = False
+        # The server session (JSESSIONID) the page was loaded in. When the site
+        # idles that session out, in-page XHRs silently get a new anonymous
+        # session with an EMPTY cart (HTTP 200); see _session_read.
+        self._page_session: Optional[str] = None
+        self._page_loaded_at: float = 0.0
 
         # Internal mock store used only when MOCK_MODE=True (tests/demo).
         self._mock_logged_in = True
@@ -142,6 +156,8 @@ class ShufersalDriver:
             page.on("close", lambda *_: self._mark_dead("page closed", page))
             page.on("crash", lambda *_: self._mark_dead("page crashed", page))
             self.page = page
+            self._page_session = await self._session_id()
+            self._page_loaded_at = time.monotonic()
             self._live_error = None
             self._last_launch_failed = False
             logger.info("Playwright persistent context started successfully.")
@@ -351,10 +367,11 @@ class ShufersalDriver:
                         f"{what} was refused by the site twice (redirected to {e.final.split('?')[0] or '/'}), "
                         "even with a fresh page; the session may need a new login.",
                         code="cart_write_rejected")
-                await self._reload_page()
+                # Never retry a write into a session that is not Or's (it would land in a guest cart).
+                await self._refresh_session(f"{what} was refused")
         raise AssertionError("unreachable")
 
-    async def _reload_page(self):
+    async def _reload_page(self, code: str = "cart_write_failed"):
         try:
             await self.page.goto(config.SHUFERSAL_BASE_URL + BASE + "/", wait_until="domcontentloaded", timeout=45000)
         except Exception as e:
@@ -362,7 +379,72 @@ class ShufersalDriver:
                 self._mark_dead(f"page unusable: {str(e)[:120]}")
                 raise APIException(status_code=503, code="browser_unavailable",
                                    message="The live browser session was lost; retry shortly.")
-            raise _upstream(f"Reloading the site page failed: {str(e)[:120]}", code="cart_write_failed")
+            raise _upstream(f"Reloading the site page failed: {str(e)[:120]}", code=code)
+        self._page_session = await self._session_id()
+        self._page_loaded_at = time.monotonic()
+
+    # ==================== Session (logged in, not stale) ====================
+
+    async def _session_id(self) -> Optional[str]:
+        try:
+            cookies = await self.context.cookies(config.SHUFERSAL_BASE_URL.rstrip("/") + BASE + "/")
+        except Exception:
+            return None
+        return next((c.get("value") for c in cookies if c.get("name") == SESSION_COOKIE), None)
+
+    async def _page_logged_in(self) -> Optional[bool]:
+        """The page's own login flag, as of when the page loaded. None if unreadable."""
+        try:
+            value = await self.page.evaluate(LOGIN_MARKER_JS)
+        except Exception:
+            return None
+        return value if isinstance(value, bool) else None
+
+    async def _session_problem(self) -> Optional[str]:
+        """Why the session the last read ran in cannot be trusted, or None."""
+        current = await self._session_id()
+        if current is not None and current != self._page_session:
+            return "the site session changed since the page loaded (it idled out on the server)"
+        logged_in = await self._page_logged_in()
+        if logged_in is not True:
+            return "the page is not logged in" if logged_in is False else "the page's login state is unreadable"
+        return None
+
+    async def _refresh_session(self, why: str):
+        """Reloads the page (a full navigation re-logs an idled-out session in
+        from the remember-me cookie and restores the real cart) and requires
+        the reloaded page to be logged in."""
+        logger.warning(f"{why}; reloading the site page to restore the logged-in session.")
+        await self._reload_page(code="session_refresh_failed")
+        logged_in = await self._page_logged_in()
+        if logged_in is not True:
+            raise APIException(
+                status_code=503, code="session_logged_out",
+                message="The Shufersal site session is not logged in"
+                        + (" (the reloaded page is a guest page)" if logged_in is False else
+                           " (the reloaded page's login state could not be read)")
+                        + "; its cart would be a guest cart, not Or's. Log in again in Chrome and restart the service.")
+
+    async def _session_read(self, read, looks_empty):
+        """Runs a cart read so that a guest or idled-out session can never pass
+        for Or's cart. Live 2026-10-19: after ~1.5 h idle the server dropped the
+        session, every in-page XHR then got a fresh anonymous session and the
+        cart read 0 items with HTTP 200 until a page load restored the login.
+        A read that ran in a changed or logged-out session, or that came back
+        empty, is repeated once after a page reload that must be logged in; if
+        the session still moves, it fails instead of answering."""
+        result = await read()
+        problem = await self._session_problem()
+        fresh_page = time.monotonic() - self._page_loaded_at < self.FRESH_PAGE_SECONDS
+        if problem is None and (fresh_page or not looks_empty(result)):
+            return result
+        await self._refresh_session(problem or "the cart read came back empty")
+        result = await read()
+        problem = await self._session_problem()
+        if problem is not None:
+            raise APIException(status_code=503, code="session_unstable",
+                               message=f"Cannot read Or's cart: {problem}, even right after a page reload.")
+        return result
 
     async def _fetch_json(self, path: str) -> Any:
         status, final, text = await self._fetch(path)
@@ -375,18 +457,22 @@ class ShufersalDriver:
 
     # ==================== Health & Login ====================
 
-    async def check_login_status(self) -> Tuple[bool, int]:
+    async def check_login_status(self) -> Tuple[bool, Optional[int]]:
         async with self._guard():
             return await self._check_login_status_unlocked()
 
-    async def _check_login_status_unlocked(self) -> Tuple[bool, int]:
+    async def _check_login_status_unlocked(self) -> Tuple[bool, Optional[int]]:
         if config.MOCK_MODE:
             return self._mock_logged_in, sum(int(item["qty"]) for item in self._mock_cart)
-        status, final, _ = await self._fetch(BASE + "/my-account")
-        # Anonymous sessions are redirected to the login page.
-        logged_in = status == 200 and "/login" not in final
-        count, _ = await self._minicart()
-        return logged_in, count
+        # Not /my-account: a guest is redirected to /my-account/personal-area,
+        # not to /login (live 2026-10-19), so that check always said logged in.
+        try:
+            count, _ = await self._session_read(self._minicart, lambda r: r[0] == 0)
+        except APIException as e:
+            if e.code == "session_logged_out":
+                return False, None
+            raise
+        return True, count
 
     # ==================== Catalog & Search ====================
 
@@ -450,13 +536,18 @@ class ShufersalDriver:
         except ParseError as e:
             raise _upstream(f"Unexpected cart count response: {e}")
 
-    async def _read_cart(self) -> Dict[str, Any]:
-        """Reads the real cart: site item count and subtotal from the mini-cart,
-        entries (exact entry numbers, codes, quantities) from the cart HTML."""
+    async def _read_cart_raw(self) -> Tuple[int, float, str]:
         count, subtotal = await self._minicart()
         status, _, html = await self._fetch(BASE + "/cart/load")
         if status != 200:
             raise _upstream(f"Cart request returned HTTP {status}.")
+        return count, subtotal, html
+
+    async def _read_cart(self) -> Dict[str, Any]:
+        """Reads the real cart: site item count and subtotal from the mini-cart,
+        entries (exact entry numbers, codes, quantities) from the cart HTML."""
+        count, subtotal, html = await self._session_read(
+            self._read_cart_raw, lambda r: r[0] == 0 and not (parse_cart_line_count(r[2]) or 0))
         try:
             entries = parse_cart_entries(html)
         except ParseError as e:

@@ -796,3 +796,99 @@ def test_cart_selling_method_from_live_markup():
     assert entries["13"]["selling_method"] == "BY_UNIT"
     assert parse_cart_line_count(html) == 3
     assert parse_cart_line_count("<div>no summary</div>") is None
+
+
+# ==================== Idled-out / guest site session ====================
+# Regression (2026-10-19 19:47): after ~1.5 h idle the site dropped the server
+# session. Every in-page XHR then ran in a NEW anonymous session: the mini-cart
+# said 0 and /cart/load was empty, both HTTP 200, so GET /cart and /health
+# reported an empty cart while Or's 18 lines were still on the site. A rebuild
+# on top of that read doubled every line. Only a page load re-logged the
+# session in (remember-me) and brought the real cart back.
+
+def _seed(site, *lines):
+    for code, qty in lines:
+        site.cart.append({"entry": len(site.cart), "code": code, "qty": float(qty)})
+
+
+def _idle(live):
+    live._page_loaded_at = 0.0  # the page was loaded long ago
+
+
+def test_idled_out_session_is_not_reported_as_an_empty_cart(live, client, site):
+    _seed(site, ("522319", 2), ("7296073746423", 1))
+    _idle(live)
+    site.expire_session()
+    gotos = len(live.page.gotos)
+    res = client.get("/cart", headers=AUTH)
+    assert res.status_code == 200, res.text
+    assert [(i["product_id"], i["qty"]) for i in res.json()["items"]] == [("522319", 2.0), ("7296073746423", 1.0)]
+    assert res.json()["item_count"] == 3
+    assert len(live.page.gotos) == gotos + 1  # one reload restored the login
+    site.expire_session()
+    health = client.get("/health", headers=AUTH).json()
+    assert health == {"status": "ok", "logged_in": True, "cart_size": 3}
+
+
+def test_session_change_is_caught_even_on_a_fresh_page(live, client, site):
+    _seed(site, ("522319", 1))
+    site.expire_session()  # no idle: detected by the changed session cookie, not by the empty read
+    res = client.get("/cart", headers=AUTH)
+    assert res.status_code == 200, res.text
+    assert [(i["product_id"], i["qty"]) for i in res.json()["items"]] == [("522319", 1.0)]
+
+
+def test_add_after_session_idled_out_does_not_double_the_line(live, client, site):
+    _seed(site, ("522319", 1))
+    _idle(live)
+    site.expire_session()
+    res = client.post("/cart/items", json={"product_id": "522319", "qty": 1},
+                      headers=dict(AUTH, **{"Idempotency-Key": "idle-add"}))
+    assert res.status_code == 200, res.text
+    assert [(i["product_id"], i["qty"]) for i in res.json()["items"]] == [("522319", 2.0)]
+    # Planned from the real cart: one update to 2, no second line, no guest-cart write.
+    assert site.cart == [{"entry": 0, "code": "522319", "qty": 2.0}] and site.anon_cart == []
+    assert len(write_requests(site)) == 1
+
+
+def test_logged_out_session_fails_loud_and_never_writes(live, client, site):
+    _seed(site, ("522319", 1))
+    _idle(live)
+    site.remember_me = False
+    site.expire_session()
+    res = client.get("/cart", headers=AUTH)
+    assert res.status_code == 503
+    assert res.json()["error"]["code"] == "session_logged_out"
+    health = client.get("/health", headers=AUTH)
+    assert health.status_code == 200
+    assert health.json() == {"status": "logged_out", "logged_in": False, "cart_size": None}
+    res = client.post("/cart/items", json={"product_id": "522319", "qty": 1},
+                      headers=dict(AUTH, **{"Idempotency-Key": "logged-out-add"}))
+    assert res.status_code == 503 and res.json()["error"]["code"] == "session_logged_out"
+    assert write_requests(site) == [] and site.anon_cart == []
+    assert site.cart == [{"entry": 0, "code": "522319", "qty": 1.0}]
+
+
+def test_really_empty_cart_reads_empty_after_one_check(live, client, site):
+    _idle(live)
+    gotos = len(live.page.gotos)
+    res = client.get("/cart", headers=AUTH)
+    assert res.status_code == 200, res.text
+    assert res.json()["items"] == [] and res.json()["item_count"] == 0
+    assert len(live.page.gotos) == gotos + 1
+    # The page was just reloaded and checked logged in: the next empty read is believed as is.
+    assert client.get("/cart", headers=AUTH).json()["items"] == []
+    assert len(live.page.gotos) == gotos + 1
+
+
+def test_unreadable_login_state_is_not_trusted(live, client, site):
+    _seed(site, ("522319", 1))
+    live.page.logged_in_marker = None  # the page no longer exposes miglog.account
+    orig_goto = live.page.goto
+
+    async def goto(url, **kw):
+        await orig_goto(url, **kw)
+        live.page.logged_in_marker = None
+    live.page.goto = goto
+    res = client.get("/cart", headers=AUTH)
+    assert res.status_code == 503 and res.json()["error"]["code"] == "session_logged_out"

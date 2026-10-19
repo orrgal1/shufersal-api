@@ -11,7 +11,8 @@ class ErrorResponse(BaseModel):
 class HealthResponse(BaseModel):
     status: str = "ok"
     logged_in: bool
-    cart_size: int
+    # None when the site session is not logged in: never report 0 for a cart we cannot see.
+    cart_size: Optional[int] = None
 
 class ProductSearchItem(BaseModel):
     id: str

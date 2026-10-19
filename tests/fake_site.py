@@ -66,6 +66,36 @@ class FakeSite:
         # change nothing (seen live 2026-10-19).
         self.csrf_token = "token-1"
         self.reject_all_writes = False
+        # The server session (JSESSIONID). It idles out on the server; the next
+        # request then gets a NEW anonymous session whose cart is empty, answered
+        # with HTTP 200 like any other read. Only a full page load re-logs it in
+        # from the remember-me cookie and restores the real cart (reproduced
+        # live 2026-10-19 by sending an unknown JSESSIONID).
+        self.session_id = "sess-1"
+        self.session_logged_in = True
+        self.remember_me = True          # False: the remember-me login is gone too
+        self._session_expired = False
+        self.anon_cart = []
+        self.page_loads = 0
+
+    def expire_session(self):
+        """The server forgets the session (idle timeout); takes effect on the next request."""
+        self._session_expired = True
+
+    def _touch_session(self):
+        if self._session_expired:
+            self._session_expired = False
+            self.session_id = f"sess-{int(self.session_id.split('-')[1]) + 1}"
+            self.session_logged_in = False
+            self.anon_cart = []
+            self.rotate_csrf()
+
+    def load_page(self):
+        """A full page navigation: remember-me logs an anonymous session back in."""
+        self._touch_session()
+        self.page_loads += 1
+        if not self.session_logged_in and self.remember_me:
+            self.session_logged_in = True
 
     def rotate_csrf(self):
         n = int(self.csrf_token.split("-")[1]) + 1
@@ -124,6 +154,16 @@ class FakeSite:
 
     # ---- router ----
     def handle(self, url, method, body, content_type):
+        self._touch_session()
+        if self.session_logged_in:
+            return self._handle(url, method, body, content_type)
+        user_cart, self.cart = self.cart, self.anon_cart
+        try:
+            return self._handle(url, method, body, content_type)
+        finally:
+            self.anon_cart, self.cart = self.cart, user_cart
+
+    def _handle(self, url, method, body, content_type):
         u = urlparse(url)
         path, q = u.path, parse_qs(u.query)
         self.requests.append((method, path, u.query, body))
@@ -192,6 +232,7 @@ class FakePage:
         self.gotos = []
         self._url = BASE + "/online/he/"
         self.csrf = site.csrf_token
+        self.logged_in_marker = site.session_logged_in
 
     @property
     def url(self):
@@ -221,7 +262,9 @@ class FakePage:
     async def goto(self, url, **kwargs):
         self.gotos.append(url)
         self.url = url
+        self.site.load_page()
         self.csrf = self.site.csrf_token
+        self.logged_in_marker = self.site.session_logged_in
 
     async def wait_for_timeout(self, ms):
         return None
@@ -232,6 +275,8 @@ class FakePage:
     async def evaluate(self, script, args=None):
         if self.closed:
             raise Exception("Target page, context or browser has been closed")
+        if args is None and "miglog.account" in script:  # login marker set when the page loaded
+            return self.logged_in_marker
         if args is None:  # checkout page state probe
             if self.site.checkout_state_sequence:
                 return dict(self.site.checkout_state, **self.site.checkout_state_sequence.pop(0))
@@ -239,6 +284,7 @@ class FakePage:
         if isinstance(args, bool):  # PayMe.clientData(isTestMode)
             return "payme-jwt"
         url, method, body, content_type = args
+        self.site._touch_session()
         if method != "GET" and (self.csrf != self.site.csrf_token or self.site.reject_all_writes):
             u = urlparse(url)
             self.site.requests.append((method, u.path, u.query, body))
@@ -264,6 +310,9 @@ class FakeContext:
 
     async def add_cookies(self, cookies):
         return None
+
+    async def cookies(self, urls=None):
+        return [{"name": "JSESSIONID", "value": self.site.session_id, "path": "/online"}]
 
     async def close(self):
         self.closed = True
