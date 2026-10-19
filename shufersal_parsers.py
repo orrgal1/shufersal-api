@@ -355,6 +355,21 @@ def extract_site_total(data: Any) -> Optional[float]:
     return None
 
 
+def parse_summary_total(text: Any) -> Optional[float]:
+    """The order total printed on /cart/cartsummary
+    (span.miglog-cart-summary-totalprice), e.g. "447.06\\n₪\\nשקלים חדשים".
+    The site labels it "סה"כ לתשלום ... כולל דמי משלוח ושרות" (including the
+    delivery/service fee of the chosen slot; verified live 2026-10-19: 411.16
+    subtotal + 35.90 fee = 447.06). Exactly one number is expected; anything
+    else is None, never a guess."""
+    if not isinstance(text, str):
+        return None
+    numbers = re.findall(r"\d[\d,]*(?:\.\d+)?", text)
+    if len(numbers) != 1:
+        return None
+    return _num(numbers[0])
+
+
 def classify_place_order(data: Any) -> Dict[str, Any]:
     """/checkout/placeOrder JSON -> {"outcome": placed|three_ds_required|rejected|unknown, ...}."""
     if isinstance(data, dict):

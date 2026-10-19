@@ -53,6 +53,14 @@ class FakeSite:
         self.checkout_state = {"path": "/online/he/checkout/multi/summary", "reauth": False, "cvv": False,
                                "threeDS": True, "threeDSTest": False}
         self.cost_summary = None  # defaults to {"totalPrice": {"value": subtotal + fee}}
+        # The live site (2026-10-19) answers GET /checkout with 302 -> /cart ->
+        # /cart/cartsummary until the customer entered the account password / SMS
+        # code in the modal that the cart summary's "מעבר לקופה" button
+        # (data-requires-pwd="always") opens. checkout_gated=True models that;
+        # checkout_reauthed is set when Or passes the modal in a watched run.
+        self.checkout_gated = False
+        self.checkout_reauthed = False
+        self.summary_total_text = None  # None: subtotal + slot fee, as the live page prints it
         self.place_order_response = {"success": True, "redirect": "/checkout/orderConfirmation/123456789"}
         self.confirmation_html = "<h1>תודה</h1><p>מספר הזמנה: 123456789</p>"
         self.orders_placed = 0
@@ -148,6 +156,22 @@ class FakeSite:
         return ('\n\n{"miniCartCount": %d, "miniCartPrice": "<span>%.2f</span><span class="currency">'
                 '<span aria-hidden="true">₪</span></span>\n\t\t"}' % (round(units), total))
 
+    def order_total(self):
+        subtotal = sum(CATALOG[e["code"]]["price"] * e["qty"] for e in self.cart)
+        fee = next((s["price"]["value"] for d in SLOTS.values() for s in d if s["code"] == self.selected_slot), 0)
+        return round(subtotal + fee, 2)
+
+    def cart_summary_state(self, path):
+        """What CART_SUMMARY_STATE_JS reads on the page (live markup 2026-10-19)."""
+        on_summary = path.rstrip("/").endswith("/cart/cartsummary")
+        total = self.summary_total_text if self.summary_total_text is not None else (
+            "\n                            %.2f\n₪\nשקלים חדשים\n" % self.order_total())
+        return {"path": path, "loggedIn": self.session_logged_in,
+                "total": total if on_summary else None,
+                "checkoutUrl": "/online/he/checkout" if on_summary else None,
+                "requiresPwd": "always" if on_summary else None,
+                "threeDS": True}
+
     def _renumber(self):
         for i, e in enumerate(self.cart):
             e["entry"] = i
@@ -210,11 +234,12 @@ class FakeSite:
             self.selected_slot = json.loads(body)["homeDeliveryTimeSlot"]["code"]
             return 200, url, "{}"
         if path == "/online/he/checkout/costSummary/direct":
+            if self.checkout_gated and not self.checkout_reauthed:
+                return 200, BASE + "/A", "<!DOCTYPE html><html></html>"  # live: redirected home
             if self.cost_summary is not None:
                 return 200, url, json.dumps(self.cost_summary)
             subtotal = sum(CATALOG[e["code"]]["price"] * e["qty"] for e in self.cart)
-            fee = next((s["price"]["value"] for d in SLOTS.values() for s in d if s["code"] == self.selected_slot), 0)
-            return 200, url, json.dumps({"subTotal": {"value": round(subtotal, 2)}, "totalPrice": {"value": round(subtotal + fee, 2)}})
+            return 200, url, json.dumps({"subTotal": {"value": round(subtotal, 2)}, "totalPrice": {"value": self.order_total()}})
         if path == "/online/he/checkout/placeOrder":
             self.orders_placed += 1
             self.place_order_query = q
@@ -237,7 +262,7 @@ class FakePage:
     @property
     def url(self):
         n = self.site.confirm_on_url_reads
-        if n is not None and "/checkout" in self._url:
+        if n is not None and ("/checkout" in self._url or "/cart/cartsummary" in self._url):
             if n <= 0:
                 self._url = self.site.confirmation_url
             else:
@@ -261,6 +286,9 @@ class FakePage:
 
     async def goto(self, url, **kwargs):
         self.gotos.append(url)
+        if (urlparse(url).path.rstrip("/") == "/online/he/checkout" and self.site.checkout_gated
+                and not self.site.checkout_reauthed):
+            url = BASE + "/online/he/cart/cartsummary"  # 302 -> /cart -> /cart/cartsummary
         self.url = url
         self.site.load_page()
         self.csrf = self.site.csrf_token
@@ -275,12 +303,17 @@ class FakePage:
     async def evaluate(self, script, args=None):
         if self.closed:
             raise Exception("Target page, context or browser has been closed")
+        if args is None and "miglog-cart-summary-totalprice" in script:
+            return self.site.cart_summary_state(urlparse(self._url).path)
         if args is None and "miglog.account" in script:  # login marker set when the page loaded
             return self.logged_in_marker
         if args is None:  # checkout page state probe
+            state = dict(self.site.checkout_state)
             if self.site.checkout_state_sequence:
-                return dict(self.site.checkout_state, **self.site.checkout_state_sequence.pop(0))
-            return dict(self.site.checkout_state)
+                state.update(self.site.checkout_state_sequence.pop(0))
+            if "/checkout" not in self._url:  # redirected away: no checkout page widgets
+                state.update(path=urlparse(self._url).path, reauth=False, cvv=False)
+            return state
         if isinstance(args, bool):  # PayMe.clientData(isTestMode)
             return "payme-jwt"
         url, method, body, content_type = args

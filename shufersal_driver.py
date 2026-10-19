@@ -25,6 +25,7 @@ from shufersal_parsers import (
     parse_order_number,
     parse_payment_method,
     parse_search_results,
+    parse_summary_total,
     public_payment,
     site_code,
 )
@@ -945,6 +946,22 @@ class ShufersalDriver:
         };
     }"""
 
+    # /cart/cartsummary, the page the site's own flow passes through on the way
+    # to checkout (verified live 2026-10-19, see _checkout_unlocked).
+    CART_SUMMARY_STATE_JS = """() => {
+        const btn = document.querySelector('.miglog-cart-summary-checkoutLink');
+        const total = document.querySelector('.miglog-cart-summary-totalprice');
+        const a = window.miglog && window.miglog.account;
+        return {
+            path: location.pathname,
+            loggedIn: a && typeof a.anonymous === 'boolean' ? !a.anonymous : null,
+            total: total ? total.textContent : null,
+            checkoutUrl: btn ? (btn.getAttribute('data-url') || null) : null,
+            requiresPwd: btn ? (btn.getAttribute('data-requires-pwd') || null) : null,
+            threeDS: !!(window.miglog && window.miglog.threeDSecure && window.miglog.threeDSecure.enabled),
+        };
+    }"""
+
     async def checkout(
         self,
         *,
@@ -978,15 +995,27 @@ class ShufersalDriver:
         return await self.page.evaluate(self.CHECKOUT_STATE_JS)
 
     async def _checkout_unlocked(self, slot_id, expected_cart_hash, confirm_total_ils, place_order, watched):
-        """Walks checkout: verify cart -> select slot -> open checkout -> read the
-        site total, then
+        """Walks checkout: verify cart -> select slot -> open the cart summary and
+        read the site total -> try the checkout page, then
           - place_order=False: stop (dry run);
-          - watched: hand over to Or in the visible window (he clears any
-            password/SMS step, the PayMe card field and 3-D Secure, and clicks the
-            site's own place-order button); the service waits for the confirmation
-            page and returns the order number it shows;
+          - watched: hand over to Or in the visible window (he clicks the site's
+            "מעבר לקופה" button, clears the password/SMS step, the PayMe card field
+            and 3-D Secure, and clicks the site's own place-order button); the
+            service waits for the confirmation page and returns its order number;
           - otherwise: call the site's placeOrder itself (only with no blockers).
-        Never touches the cart contents."""
+        Never touches the cart contents.
+
+        The site's own route (verified live 2026-10-19 from the page and its
+        main JS): cart -> /cart/cartsummary, whose "מעבר לקופה" button carries
+        data-url="/online/he/checkout" data-requires-pwd="always". Its click
+        handler GETs /checkout/cart-order-updatable, then ALWAYS opens the
+        password/SMS modal (/cart/checkout/auth) for a non-agent customer and
+        only navigates to /checkout after that succeeds. Without that re-auth
+        the server answers GET /checkout with 302 -> /cart -> /cart/cartsummary,
+        and /checkout/costSummary/direct redirects home. So the service, which
+        never logs in or types codes, cannot open the checkout page by itself:
+        the site total is read from the cart summary, which prints the order
+        total including the chosen slot's delivery/service fee."""
         summary = await self._checkout_summary_unlocked(slot_id)
         if summary["cart_hash"] != expected_cart_hash:
             raise APIException(status_code=409, code="cart_mismatch",
@@ -1014,43 +1043,68 @@ class ShufersalDriver:
         if status != 200:
             raise _upstream(f"Selecting the delivery slot returned HTTP {status}.", code="slot_select_failed")
 
-        # 2. Open the checkout page the way the cart's checkout button does.
+        # 2. The cart summary page (the cart's own "go to checkout" link) and its total.
+        try:
+            await self.page.goto(config.SHUFERSAL_BASE_URL + BASE + "/cart/cartsummary",
+                                 wait_until="domcontentloaded", timeout=45000)
+            await self.page.wait_for_timeout(4000)
+            cs_state = await self.page.evaluate(self.CART_SUMMARY_STATE_JS)
+        except APIException:
+            raise
+        except Exception as e:
+            raise _upstream(f"Opening the cart summary page failed: {str(e)[:120]}", code="checkout_unreachable")
+        cs_path = str(cs_state.get("path") or "")
+        reached_summary = cs_path.rstrip("/").endswith("/cart/cartsummary")
+        summary_total = parse_summary_total(cs_state.get("total")) if reached_summary else None
+        if not reached_summary:
+            blockers.append(f"the cart summary page redirected to {cs_path or 'unknown'}")
+        if cs_state.get("loggedIn") is not True:
+            blockers.append("the site session on the cart summary page is not a logged-in customer")
+        requires_pwd = cs_state.get("requiresPwd") == "always"
+
+        # 3. The checkout page. The site redirects it back to the cart summary
+        #    until the account password / SMS code was entered there.
         try:
             await self.page.goto(config.SHUFERSAL_BASE_URL + BASE + "/checkout", wait_until="domcontentloaded", timeout=45000)
             await self.page.wait_for_timeout(4000)
             page_state = await self._page_state()
-            if watched and page_state.get("reauth"):
-                # Or enters the password / SMS code in the visible window.
-                deadline = time.monotonic() + config.WATCH_TIMEOUT_SECONDS
-                while page_state.get("reauth") and time.monotonic() < deadline:
-                    await asyncio.sleep(config.WATCH_POLL_SECONDS)
-                    page_state = await self._page_state()
         except APIException:
             raise
         except Exception as e:
             raise _upstream(f"Opening the checkout page failed: {str(e)[:120]}", code="checkout_unreachable")
         path = str(page_state.get("path") or "")
-        reached = "checkout" in path
-        if not reached:
+        reached = "/checkout" in path
+        gated = not reached and path.rstrip("/").endswith("/cart/cartsummary")
+        if gated:
+            # Or passes this gate himself in a watched run; nothing else can.
+            (warnings if watched else blockers).append(
+                "the checkout page needs the account password or an SMS code first (the site redirects it to "
+                "the cart summary); in the visible window click 'מעבר לקופה' and enter it")
+        elif not reached:
             blockers.append(f"checkout page redirected to {path or 'unknown'}")
         if page_state.get("reauth"):
-            blockers.append("the site asks for the account password or an SMS code before checkout")
+            (warnings if watched else blockers).append(
+                "the site asks for the account password or an SMS code before checkout")
         if page_state.get("cvv"):
             (warnings if watched else blockers).append(
                 "the checkout page shows a CVV / PayMe card field; the service never types card data")
 
-        # 3. The site's own total for the order.
-        site_total = None
+        # 4. The site's own total for the order: the checkout page's cost summary
+        #    when the checkout page opened, else the cart summary page's total.
+        site_total, total_source = None, None
         if reached:
             try:
                 status, _, text = await self._fetch(f"{BASE}/checkout/costSummary/direct")
                 if status == 200:
                     site_total = extract_site_total(json.loads(text))
+                    total_source = "checkout" if site_total is not None else None
             except (APIException, ValueError):
                 site_total = None
+        if site_total is None and summary_total is not None:
+            site_total, total_source = summary_total, "cart_summary"
         if site_total is None:
             # Blocks watched runs too: the total must be checked by the service, not only by eye.
-            blockers.append("could not read the order total from the checkout page")
+            blockers.append("could not read the order total from the cart summary or checkout page")
         elif abs(site_total - confirm_total_ils) > 0.01:
             raise APIException(status_code=409, code="total_drift",
                                message=f"The site total ({site_total} ILS) differs from confirm_total_ils.")
@@ -1060,7 +1114,10 @@ class ShufersalDriver:
             "site_total_ils": site_total,
             "blockers": blockers,
             "warnings": warnings,
-            "checks": {"reached_checkout": reached, "three_ds_enabled": bool(page_state.get("threeDS")),
+            "checks": {"reached_cart_summary": reached_summary, "reached_checkout": reached,
+                       "checkout_needs_password": bool(gated or (requires_pwd and not reached)),
+                       "site_total_source": total_source,
+                       "three_ds_enabled": bool(page_state.get("threeDS") or cs_state.get("threeDS")),
                        "cvv_field_present": bool(page_state.get("cvv")), "watched": bool(watched)},
         }
         if not place_order:

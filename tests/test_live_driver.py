@@ -412,6 +412,7 @@ def test_dry_run_reports_blockers(live, client, site):
     q = _quote(client)
     site.checkout_state.update(reauth=True, cvv=True)
     site.cost_summary = {"unrelated": 1}
+    site.summary_total_text = ""
     body = client.post("/checkout/submit", json={"quote_id": q["quote_id"], "confirm_total_ils": q["total_ils"],
                                                  "expected_cart_hash": q["cart_hash"]}, headers=AUTH).json()
     assert body["status"] == "dry_run"
@@ -633,11 +634,115 @@ def test_watched_run_blocks_when_total_is_unreadable(live, client, site, armed, 
     _fill(site)
     q = _quote(client)
     site.cost_summary = {"entries": [{"totalPrice": {"value": 1}}]}
+    site.summary_total_text = "₪ שקלים חדשים"
     site.confirm_on_url_reads = 0
     dry = client.post("/checkout/submit", json={**_real(q, watched=True), "dry_run": True, "confirm": False}, headers=AUTH)
     assert any("order total" in b for b in dry.json()["blockers"])
     res = client.post("/checkout/submit", json=_real(q, watched=True), headers={**AUTH, "Idempotency-Key": "watch-total"})
     assert res.status_code == 409 and res.json()["error"]["code"] == "checkout_blocked"
+
+
+# ==================== Checkout gate (live site 2026-10-19) ====================
+# GET /checkout redirects to /cart/cartsummary until the account password / SMS
+# code was entered in the modal behind the cart summary's "מעבר לקופה" button.
+
+def _dry(q, **extra):
+    return {"quote_id": q["quote_id"], "confirm_total_ils": q["total_ils"], "expected_cart_hash": q["cart_hash"], **extra}
+
+
+def test_gated_dry_run_reads_the_cart_summary_total_and_stops(live, client, site):
+    _fill(site)
+    site.checkout_gated = True
+    q = _quote(client)
+    cart_before = [dict(e) for e in site.cart]
+    res = client.post("/checkout/submit", json=_dry(q), headers=AUTH)
+    assert res.status_code == 200, res.text
+    body = res.json()
+    assert body["status"] == "dry_run" and body["order_id"] is None
+    assert body["site_total_ils"] == q["total_ils"] == round(7.35 * 2 + 39.9 + 35.9, 2)
+    checks = body["checks"]
+    assert checks["reached_cart_summary"] is True and checks["reached_checkout"] is False
+    assert checks["checkout_needs_password"] is True and checks["site_total_source"] == "cart_summary"
+    # An unattended order cannot pass the password gate: reported as a blocker.
+    assert len(body["blockers"]) == 1 and "password" in body["blockers"][0]
+    page = live.page
+    assert page.gotos[-2:] == ["https://www.shufersal.co.il/online/he/cart/cartsummary",
+                               "https://www.shufersal.co.il/online/he/checkout"]
+    assert site.orders_placed == 0 and site.cart == cart_before
+    assert [r[1] for r in write_requests(site)] == ["/online/he/timeSlot/preselection/postHomeDeliverySlot"]
+    assert not any(r[1] == "/online/he/checkout/placeOrder" for r in site.requests)
+
+
+def test_gated_watched_dry_run_has_no_blockers(live, client, site, watch_fast):
+    _fill(site)
+    site.checkout_gated = True
+    q = _quote(client)
+    body = client.post("/checkout/submit", json=_dry(q, watched=True), headers=AUTH).json()
+    assert body["status"] == "dry_run" and body["blockers"] == []
+    assert body["site_total_ils"] == q["total_ils"]
+    assert any("מעבר לקופה" in w for w in body["warnings"])
+    assert site.orders_placed == 0
+
+
+def test_gated_watched_order_is_handed_to_or_on_the_cart_summary(live, client, site, armed, watch_fast):
+    _fill(site)
+    site.checkout_gated = True
+    q = _quote(client)
+    site.confirm_on_url_reads = 3  # Or clicks through password, payment and place-order
+    res = client.post("/checkout/submit", json=_real(q, watched=True), headers={**AUTH, "Idempotency-Key": "gate-w"})
+    assert res.status_code == 200, res.text
+    body = res.json()
+    assert body["status"] == "placed" and body["order_id"] == "987654321"
+    assert body["blockers"] == [] and body["site_total_ils"] == q["total_ils"]
+    assert site.orders_placed == 0  # the service never calls placeOrder in a watched run
+
+
+def test_gated_unwatched_order_is_blocked(live, client, site, armed):
+    _fill(site)
+    site.checkout_gated = True
+    q = _quote(client)
+    res = client.post("/checkout/submit", json=_real(q), headers={**AUTH, "Idempotency-Key": "gate-u"})
+    assert res.status_code == 409 and res.json()["error"]["code"] == "checkout_blocked"
+    assert site.orders_placed == 0
+
+
+def test_cart_summary_total_drift_is_refused(live, client, site, armed, watch_fast):
+    _fill(site)
+    site.checkout_gated = True
+    q = _quote(client)
+    site.summary_total_text = "999.99\n₪\nשקלים חדשים"
+    res = client.post("/checkout/submit", json=_dry(q, watched=True), headers=AUTH)
+    assert res.status_code == 409 and res.json()["error"]["code"] == "total_drift"
+
+
+def test_guest_cart_summary_page_blocks(live, client, site, watch_fast, monkeypatch):
+    _fill(site)
+    site.checkout_gated = True
+    q = _quote(client)
+    real = site.cart_summary_state
+    monkeypatch.setattr(site, "cart_summary_state", lambda path: dict(real(path), loggedIn=False))
+    body = client.post("/checkout/submit", json=_dry(q, watched=True), headers=AUTH).json()
+    assert any("logged-in" in b for b in body["blockers"])
+
+
+def test_checkout_total_wins_over_cart_summary_when_checkout_opens(live, client, site):
+    _fill(site)
+    q = _quote(client)
+    site.summary_total_text = "1.00 ₪"  # would drift; the checkout cost summary is authoritative
+    body = client.post("/checkout/submit", json=_dry(q), headers=AUTH).json()
+    assert body["site_total_ils"] == q["total_ils"] and body["checks"]["site_total_source"] == "checkout"
+
+
+@pytest.mark.parametrize("text,expected", [
+    ("\n                            447.06\n₪\nשקלים חדשים\n", 447.06),
+    ("1,234.50 ₪", 1234.5),
+    ("₪ שקלים חדשים", None),
+    ("447.06 ₪ 2.00", None),
+    (None, None),
+])
+def test_parse_summary_total(text, expected):
+    from shufersal_parsers import parse_summary_total
+    assert parse_summary_total(text) == expected
 
 
 def test_old_key_with_new_quote_is_refused_not_replayed(live, client, site, armed):
