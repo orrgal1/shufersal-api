@@ -34,6 +34,16 @@ CART_CONTEXT = urlencode({"cartContext[openFrom]": "CATALOG", "cartContext[recom
 QTY_TOLERANCE = 0.001
 
 
+class _WriteRejected(APIException):
+    """A write the site refused by redirecting it (HTTP 200, nothing applied).
+    Cart writes retry it once with a fresh page; any other write gets a 502."""
+
+    def __init__(self, final: str):
+        super().__init__(status_code=502, code="write_rejected",
+                         message=f"The site refused the request and redirected to {final.split('?')[0] or '/'}.")
+        self.final = final
+
+
 def _upstream(message: str, code: str = "upstream_error", status: int = 502) -> APIException:
     return APIException(status_code=status, code=code, message=message)
 
@@ -297,7 +307,7 @@ class ShufersalDriver:
             if (body !== null && method !== 'GET') opts.body = body;
             try {
                 const res = await fetch(url, opts);
-                return { status: res.status, url: res.url, text: await res.text() };
+                return { status: res.status, url: res.url, redirected: res.redirected, text: await res.text() };
             } catch (err) {
                 return { status: 0, url: url, text: String(err) };
             }
@@ -315,7 +325,42 @@ class ShufersalDriver:
         final = str(res.get("url") or "").replace(config.SHUFERSAL_BASE_URL.rstrip("/"), "")
         if status == 0:
             raise _upstream(f"Network error calling {path.split('?')[0]}.")
+        if method != "GET" and res.get("redirected") and final.split("?")[0].rstrip("/") != path.split("?")[0].rstrip("/"):
+            # The site answers a write it refuses (above all a stale CSRF token)
+            # with a redirect to the home page and HTTP 200; nothing was applied.
+            raise _WriteRejected(final)
         return status, final, res.get("text") or ""
+
+    async def _write(self, path: str, body: str, content_type: str, what: str) -> int:
+        """POSTs a cart write. The CSRF token is read from the page when it
+        loaded and goes stale once the site rotates the session (seen live after
+        ~a day of uptime: every write was silently redirected home). A refused
+        write changed nothing, so the page is reloaded for a fresh token and the
+        write is sent once more; a second refusal is an error."""
+        for attempt in (1, 2):
+            try:
+                status, _, _ = await self._fetch(path, method="POST", body=body, content_type=content_type)
+                return status
+            except _WriteRejected as e:
+                logger.warning(f"{what} was refused by the site (redirected to {e.final.split('?')[0] or '/'}); "
+                               f"attempt {attempt}, reloading the page for a fresh session token.")
+                if attempt == 2:
+                    raise _upstream(
+                        f"{what} was refused by the site twice (redirected to {e.final.split('?')[0] or '/'}), "
+                        "even with a fresh page; the session may need a new login.",
+                        code="cart_write_rejected")
+                await self._reload_page()
+        raise AssertionError("unreachable")
+
+    async def _reload_page(self):
+        try:
+            await self.page.goto(config.SHUFERSAL_BASE_URL + BASE + "/", wait_until="domcontentloaded", timeout=45000)
+        except Exception as e:
+            if not self._is_alive():
+                self._mark_dead(f"page unusable: {str(e)[:120]}")
+                raise APIException(status_code=503, code="browser_unavailable",
+                                   message="The live browser session was lost; retry shortly.")
+            raise _upstream(f"Reloading the site page failed: {str(e)[:120]}", code="cart_write_failed")
 
     async def _fetch_json(self, path: str) -> Any:
         status, final, text = await self._fetch(path)
@@ -472,11 +517,11 @@ class ShufersalDriver:
 
     async def _post_update(self, line_id: str, qty: float, selling_method: str):
         params = urlencode({"entryNumber": line_id, "qty": _fmt_qty(qty), "sellingMethod": selling_method})
-        status, _, _ = await self._fetch(
+        status = await self._write(
             f"{BASE}/cart/update?{params}",
-            method="POST",
             body=urlencode({"quantity": _fmt_qty(qty)}),
             content_type="application/x-www-form-urlencoded; charset=UTF-8",
+            what="Cart update",
         )
         if status != 200:
             raise _upstream(f"Cart update returned HTTP {status}.", code="cart_write_failed")
@@ -491,11 +536,11 @@ class ShufersalDriver:
             "comment": "",
             "affiliateCode": "",
         }
-        status, _, _ = await self._fetch(
+        status = await self._write(
             f"{BASE}/cart/add?{CART_CONTEXT}",
-            method="POST",
             body=json.dumps(payload),
             content_type="application/json",
+            what="Add to cart",
         )
         if status != 200:
             raise _upstream(f"Add to cart returned HTTP {status}.", code="cart_write_failed")

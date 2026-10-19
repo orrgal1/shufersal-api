@@ -169,6 +169,44 @@ def test_add_ignored_by_site_is_an_error(live, client, site):
     assert res.json()["error"]["code"] == "cart_write_unverified"
 
 
+# Regression (2026-10-19): the page's CSRF token went stale after the site
+# rotated the session; every add was redirected home with HTTP 200, nothing
+# was applied, and each POST /cart/items failed as cart_write_unverified.
+
+def test_add_with_stale_csrf_reloads_page_and_lands_once(live, client, site):
+    site.rotate_csrf()
+    gotos = len(live.page.gotos)
+    res = client.post("/cart/items", json={"product_id": "522319", "qty": 1},
+                      headers=dict(AUTH, **{"Idempotency-Key": "stale-csrf-add"}))
+    assert res.status_code == 200, res.text
+    assert [(i["product_id"], i["qty"]) for i in res.json()["items"]] == [("522319", 1.0)]
+    assert len(live.page.gotos) == gotos + 1  # one reload for a fresh token
+    adds = [r for r in site.requests if r[1] == "/online/he/cart/add"]
+    assert len(adds) == 2  # refused once, then applied once
+    assert len(site.cart) == 1
+
+
+def test_update_and_delete_with_stale_csrf_recover(live, client, site):
+    client.post("/cart/items", json={"product_id": "522319", "qty": 1}, headers=AUTH)
+    site.rotate_csrf()
+    res = client.patch("/cart/items/0", json={"qty": 3, "product_code": "522319"}, headers=AUTH)
+    assert res.status_code == 200, res.text
+    assert res.json()["items"][0]["qty"] == 3.0
+    site.rotate_csrf()
+    res = client.delete("/cart/items/0?product_code=522319", headers=AUTH)
+    assert res.status_code == 200, res.text
+    assert res.json()["items"] == [] and site.cart == []
+
+
+def test_write_refused_even_after_reload_is_a_clear_error(live, client, site):
+    site.reject_all_writes = True
+    res = client.post("/cart/items", json={"product_id": "522319", "qty": 1}, headers=AUTH)
+    assert res.status_code == 502
+    assert res.json()["error"]["code"] == "cart_write_rejected"
+    assert len([r for r in site.requests if r[1] == "/online/he/cart/add"]) == 2
+    assert site.cart == []
+
+
 def test_update_ignored_by_site_is_an_error(live, client, site):
     client.post("/cart/items", json={"product_id": "522319", "qty": 1}, headers=AUTH)
     site.fail_update = True

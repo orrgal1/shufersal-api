@@ -58,6 +58,15 @@ class FakeSite:
         self.checkout_state_sequence = []  # page states returned before checkout_state (e.g. re-auth, then clear)
         self.confirm_on_url_reads = None   # watched run: Or "clicks" place-order after N url reads
         self.confirmation_url = BASE + "/online/he/checkout/orderConfirmation/987654321"
+        # The session CSRF token. A page holds the value current when it loaded;
+        # writes carrying an older one are redirected home with HTTP 200 and
+        # change nothing (seen live 2026-10-19).
+        self.csrf_token = "token-1"
+        self.reject_all_writes = False
+
+    def rotate_csrf(self):
+        n = int(self.csrf_token.split("-")[1]) + 1
+        self.csrf_token = f"token-{n}"
 
     # ---- helpers ----
     def _render_cart(self):
@@ -158,6 +167,7 @@ class FakePage:
         self.handlers = {}
         self.gotos = []
         self._url = BASE + "/online/he/"
+        self.csrf = site.csrf_token
 
     @property
     def url(self):
@@ -187,6 +197,7 @@ class FakePage:
     async def goto(self, url, **kwargs):
         self.gotos.append(url)
         self.url = url
+        self.csrf = self.site.csrf_token
 
     async def wait_for_timeout(self, ms):
         return None
@@ -204,8 +215,12 @@ class FakePage:
         if isinstance(args, bool):  # PayMe.clientData(isTestMode)
             return "payme-jwt"
         url, method, body, content_type = args
+        if method != "GET" and (self.csrf != self.site.csrf_token or self.site.reject_all_writes):
+            u = urlparse(url)
+            self.site.requests.append((method, u.path, u.query, body))
+            return {"status": 200, "url": BASE + "/online/he", "redirected": True, "text": "<!DOCTYPE html><html></html>"}
         status, final, text = self.site.handle(url, method, body, content_type)
-        return {"status": status, "url": final, "text": text}
+        return {"status": status, "url": final, "redirected": False, "text": text}
 
 
 class FakeContext:
