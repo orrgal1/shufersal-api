@@ -9,6 +9,7 @@ import main
 from checkout_ledger import CheckoutLedger
 from sms_codes import SmsCodeReader, check_issuer_code
 from tests.test_live_driver import AUTH, _fill, _quote, _real, client, live, make_driver, site  # noqa: F401
+from tests.submit import submit
 
 
 @pytest.fixture
@@ -28,7 +29,7 @@ def ua(monkeypatch, live, site):
 
 
 def _submit(client, q, key, **extra):
-    return client.post("/checkout/submit", json=_real(q, **extra), headers={**AUTH, "Idempotency-Key": key})
+    return submit(client, "/checkout/submit", json=_real(q, **extra), headers={**AUTH, "Idempotency-Key": key})
 
 
 def _no_secrets(caplog, res, site):
@@ -215,9 +216,9 @@ def test_unattended_needs_both_flags(monkeypatch, ua, client, site):
 
 def test_existing_confirm_key_and_hash_checks_still_apply(ua, client, site):
     q = _quote(client)
-    res = client.post("/checkout/submit", json=_real(q, confirm=False), headers={**AUTH, "Idempotency-Key": "k"})
+    res = submit(client, "/checkout/submit", json=_real(q, confirm=False), headers={**AUTH, "Idempotency-Key": "k"})
     assert res.json()["error"]["code"] == "confirmation_required"
-    res = client.post("/checkout/submit", json=_real(q), headers=AUTH)
+    res = submit(client, "/checkout/submit", json=_real(q), headers=AUTH)
     assert res.json()["error"]["code"] == "idempotency_key_required"
     res = _submit(client, q, "ua-5", expected_cart_hash="0" * 16)
     assert res.json()["error"]["code"] == "cart_mismatch"

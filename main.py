@@ -1,4 +1,5 @@
 import argparse
+import asyncio
 import sys
 import json
 import uuid
@@ -10,6 +11,7 @@ from typing import Any, Dict, Optional
 
 from fastapi import FastAPI, Depends, Header, Request, status
 from fastapi.responses import JSONResponse
+from starlette.background import BackgroundTask
 from fastapi.exceptions import RequestValidationError
 
 import config
@@ -45,21 +47,24 @@ SAFE_CHECKOUT_CODES = {
     "slot_select_failed", "checkout_unreachable", "quote_consumed", "cart_incomplete", "checkout_in_progress", "payment_method_unavailable", "invalid_input",
     "order_over_cap", "order_outcome_unresolved", "reauth_failed", "sms_unavailable", "sms_code_timeout",
     "sms_code_ambiguous", "products_unavailable", "attempt_interrupted", "adult_recipient_required",
-    "checkout_requirement",
+    "checkout_requirement", "idempotency_key_unknown",
 }
 # Idempotency-Keys whose order attempt is running in THIS process right now. A
 # same-key request (e.g. a gateway retry on a slow answer) gets 202 in_progress.
 ACTIVE_SUBMIT_KEYS: set = set()
+# The background tasks running those attempts (strong references; awaited on shutdown).
+SUBMIT_TASKS: set = set()
 IN_PROGRESS_POLL_SECONDS = 30
 
 
 def _error_body(exc: "APIException", path: str = "/checkout/submit") -> Dict[str, Any]:
     """The error body the API returns for exc (the same filtering as the handler)."""
     message = exc.message
-    if path == "/checkout/submit" and exc.code not in SAFE_CHECKOUT_CODES:
+    submit = path.startswith("/checkout/submit")
+    if submit and exc.code not in SAFE_CHECKOUT_CODES:
         message = "Checkout could not be completed."
     error = {"code": exc.code, "message": message}
-    if exc.details and (path != "/checkout/submit" or exc.code in SAFE_CHECKOUT_CODES):
+    if exc.details and (not submit or exc.code in SAFE_CHECKOUT_CODES):
         error["details"] = exc.details
     return {"error": error}
 
@@ -75,6 +80,10 @@ async def lifespan(app: FastAPI):
     logger.info("Initializing Shufersal service...")
     await shufersal_driver.start()
     yield
+    # Shutdown: let a running order attempt finish before the browser goes away.
+    if SUBMIT_TASKS:
+        logger.info("Waiting for %d running order attempt(s) before shutdown...", len(SUBMIT_TASKS))
+        await asyncio.gather(*list(SUBMIT_TASKS), return_exceptions=True)
     # Shutdown: clean up browser resources
     logger.info("Shutting down Shufersal service...")
     await shufersal_driver.stop()
@@ -103,7 +112,7 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
 
 @app.exception_handler(Exception)
 async def generic_exception_handler(request: Request, exc: Exception):
-    if request.url.path == "/checkout/submit":
+    if request.url.path.startswith("/checkout/submit"):
         logger.error("Unhandled checkout submission error")
     else:
         logger.error(f"Unhandled server error on {request.url.path}: {exc}", exc_info=True)
@@ -332,7 +341,9 @@ def _begin_placing(key: str):
                                    "checks the site and runs `checkout_ledger.py resolve <key> placed|not_placed`.")
 
 
-@app.post("/checkout/submit", response_model=CheckoutSubmitResponse)
+@app.post("/checkout/submit", response_model=CheckoutSubmitResponse,
+          responses={202: {"description": "Real order started or still running (in_progress); poll with the "
+                                          "same request and key or GET /checkout/submit/{idempotency_key}."}})
 async def submit_checkout(
     payload: CheckoutSubmitRequest,
     idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key")
@@ -352,6 +363,14 @@ async def submit_checkout(
     reads the order number from the confirmation page. Capped by
     SHUFERSAL_MAX_ORDER_ILS. An ambiguous outcome blocks further orders until
     resolved with `checkout_ledger.py resolve`.
+
+    Real orders (dry_run=false) run in the background: once the request is
+    validated and the Idempotency-Key is claimed, the answer is immediately
+    202 {"status": "in_progress", "poll": "same request, same Idempotency-Key",
+    "retry_after": 30}. Poll with the same request and key, or with
+    GET /checkout/submit/{idempotency_key}: 202 in_progress while it runs, then
+    the stored final result (HTTP status and body as a synchronous submit would
+    have returned). Dry runs answer synchronously.
     """
     quote = quote_store.get_quote(payload.quote_id)
     if not quote:
@@ -403,13 +422,71 @@ async def submit_checkout(
         if previous is not None:
             return _replay_submit(idempotency_key, previous)
 
-    if place_order:
-        ACTIVE_SUBMIT_KEYS.add(idempotency_key)
-    try:
+    if not place_order:
         return await _run_submit(payload, quote, expected_hash, place_order, unattended, idempotency_key)
+
+    # Real order: the key is claimed; run the attempt in the background and answer now,
+    # so a slow checkout (SMS re-auth, 3-D Secure) never outlives a proxy timeout.
+    # Nothing awaits between the claim and this point, so no same-key request can
+    # see the claim without the key being active.
+    ACTIVE_SUBMIT_KEYS.add(idempotency_key)
+    task = asyncio.create_task(
+        _background_submit(payload, quote, expected_hash, unattended, idempotency_key))
+    SUBMIT_TASKS.add(task)
+    task.add_done_callback(SUBMIT_TASKS.discard)
+    log_mutation("POST", "/checkout/submit", 202, None, {"started": True})
+    # The response is sent first; the request cycle then waits (shielded) for the
+    # attempt, so a graceful server shutdown waits for it too.
+    return _in_progress_response(idempotency_key, "in_progress",
+                                 background=BackgroundTask(_await_attempt, task))
+
+
+async def _await_attempt(task: "asyncio.Task"):
+    try:
+        await asyncio.shield(task)  # never cancels the attempt itself
+    except BaseException:  # noqa: BLE001 - the attempt reports through the ledger
+        pass
+
+
+async def _background_submit(payload, quote, expected_hash, unattended, idempotency_key):
+    """Runs a claimed real-order attempt. _run_submit records every outcome in the
+    ledger (including failures); nothing here may reach the caller directly."""
+    try:
+        await _run_submit(payload, quote, expected_hash, True, unattended, idempotency_key)
+    except APIException as exc:
+        log_mutation("POST", "/checkout/submit", exc.status_code, None, {"failed": exc.code})
+    except BaseException as exc:  # noqa: BLE001 - outcome is already in the ledger
+        logger.error("Unhandled checkout submission error")
+        if isinstance(exc, asyncio.CancelledError):
+            raise
     finally:
-        if place_order:
-            ACTIVE_SUBMIT_KEYS.discard(idempotency_key)
+        ACTIVE_SUBMIT_KEYS.discard(idempotency_key)
+
+
+def _in_progress_response(key: str, state: str, background=None) -> JSONResponse:
+    """202: the attempt with this Idempotency-Key is running; poll for its result."""
+    return JSONResponse(
+        status_code=202, headers={"Retry-After": str(IN_PROGRESS_POLL_SECONDS)}, background=background,
+        content={"status": "in_progress", "poll": "same request, same Idempotency-Key",
+                 "poll_url": f"/checkout/submit/{key}", "retry_after": IN_PROGRESS_POLL_SECONDS,
+                 "retry_after_seconds": IN_PROGRESS_POLL_SECONDS, "idempotency_key_state": state,
+                 "message": "The order attempt with this Idempotency-Key is running. Do NOT retry with a "
+                            "new key; send this same request with the same key again (or GET "
+                            f"/checkout/submit/{key}) in about {IN_PROGRESS_POLL_SECONDS} s to get its result."})
+
+
+@app.get("/checkout/submit/{idempotency_key}", response_model=CheckoutSubmitResponse,
+         responses={202: {"description": "Still running; poll again after Retry-After seconds."}})
+async def get_checkout_submit(idempotency_key: str):
+    """GET /checkout/submit/{idempotency_key}: the result of the real-order attempt
+    with that key. 202 in_progress while it runs; then the stored final result,
+    exactly as POSTing the same request with the same key would answer. Never runs
+    a checkout. 404 idempotency_key_unknown when no attempt used the key."""
+    previous = checkout_ledger.get(idempotency_key)
+    if previous is None:
+        raise APIException(status_code=404, code="idempotency_key_unknown",
+                           message="No order attempt used this Idempotency-Key.")
+    return _replay_submit(idempotency_key, previous)
 
 
 def _replay_submit(key: str, previous: Dict[str, Any]) -> JSONResponse:
@@ -417,16 +494,10 @@ def _replay_submit(key: str, previous: Dict[str, Any]) -> JSONResponse:
     the checkout again; answers with that attempt's stored outcome."""
     state, result = previous["state"], previous.get("result")
     if state in ("in_progress", "placing") and key in ACTIVE_SUBMIT_KEYS:
-        # The first request with this key is still running (e.g. this is a
-        # gateway retry of a slow request). Not a failure and not a reason for a new key.
+        # The attempt with this key is still running in this process. Not a
+        # failure and not a reason for a new key.
         log_mutation("POST", "/checkout/submit", 202, None, {"in_progress": True})
-        return JSONResponse(
-            status_code=202, headers={"Retry-After": str(IN_PROGRESS_POLL_SECONDS)},
-            content={"status": "in_progress", "idempotency_key_state": state,
-                     "message": "An order attempt with this Idempotency-Key is still running. Do NOT retry with a "
-                                f"new key; send this same request with the same key again in about "
-                                f"{IN_PROGRESS_POLL_SECONDS} s to get its result.",
-                     "retry_after_seconds": IN_PROGRESS_POLL_SECONDS})
+        return _in_progress_response(key, state)
     if result:
         log_mutation("POST", "/checkout/submit", previous["http_status"], None, {"replayed": True})
         return JSONResponse(status_code=previous["http_status"] or 409, content=result,

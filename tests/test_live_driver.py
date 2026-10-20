@@ -17,6 +17,7 @@ import main
 from security import APIException, generate_jwt_token
 from shufersal_driver import ShufersalDriver
 from tests.fake_site import FakeSite, install_fake_playwright
+from tests.submit import submit
 
 AUTH = {"Authorization": f"Bearer {generate_jwt_token(subject='live-driver-test', expires_days=1)}"}
 
@@ -384,7 +385,7 @@ def test_dry_run_walks_checkout_and_stops_before_placing(live, client, site):
     _fill(site)
     q = _quote(client)
     cart_before = [dict(e) for e in site.cart]
-    res = client.post("/checkout/submit", json={"quote_id": q["quote_id"], "confirm_total_ils": q["total_ils"],
+    res = submit(client, "/checkout/submit", json={"quote_id": q["quote_id"], "confirm_total_ils": q["total_ils"],
                                                 "expected_cart_hash": q["cart_hash"]}, headers=AUTH)
     assert res.status_code == 200, res.text
     body = res.json()
@@ -413,7 +414,7 @@ def test_dry_run_reports_blockers(live, client, site):
     site.checkout_state.update(reauth=True, cvv=True)
     site.cost_summary = {"unrelated": 1}
     site.summary_total_text = ""
-    body = client.post("/checkout/submit", json={"quote_id": q["quote_id"], "confirm_total_ils": q["total_ils"],
+    body = submit(client, "/checkout/submit", json={"quote_id": q["quote_id"], "confirm_total_ils": q["total_ils"],
                                                  "expected_cart_hash": q["cart_hash"]}, headers=AUTH).json()
     assert body["status"] == "dry_run"
     assert len(body["blockers"]) == 3
@@ -424,7 +425,7 @@ def test_cart_change_after_quote_aborts(live, client, site, armed):
     _fill(site)
     q = _quote(client)
     site.cart[0]["qty"] = 3.0
-    res = client.post("/checkout/submit", json={"quote_id": q["quote_id"], "confirm_total_ils": q["total_ils"],
+    res = submit(client, "/checkout/submit", json={"quote_id": q["quote_id"], "confirm_total_ils": q["total_ils"],
                                                 "expected_cart_hash": q["cart_hash"], "dry_run": False, "confirm": True},
                       headers={**AUTH, "Idempotency-Key": "change-1"})
     assert res.status_code == 409 and res.json()["error"]["code"] == "cart_mismatch"
@@ -436,11 +437,11 @@ def test_real_order_returns_site_order_number_once(live, client, site, armed):
     q = _quote(client)
     req = {"quote_id": q["quote_id"], "confirm_total_ils": q["total_ils"], "expected_cart_hash": q["cart_hash"],
            "dry_run": False, "confirm": True}
-    res = client.post("/checkout/submit", json=req, headers={**AUTH, "Idempotency-Key": "order-1"})
+    res = submit(client, "/checkout/submit", json=req, headers={**AUTH, "Idempotency-Key": "order-1"})
     assert res.status_code == 200, res.text
     assert res.json()["status"] == "placed" and res.json()["order_id"] == "123456789"
     assert site.place_order_query["jwtPayme"] == ["payme-jwt"]
-    again = client.post("/checkout/submit", json=req, headers={**AUTH, "Idempotency-Key": "order-1"})
+    again = submit(client, "/checkout/submit", json=req, headers={**AUTH, "Idempotency-Key": "order-1"})
     assert again.json() == res.json()
     assert site.orders_placed == 1
     assert len(site.cart) == 2  # checkout does not clear the cart itself
@@ -451,7 +452,7 @@ def test_real_order_without_parsable_number_is_not_invented(live, client, site, 
     q = _quote(client)
     site.place_order_response = {"success": True, "redirect": "/checkout/thanks"}
     site.confirmation_html = "<p>תודה!</p>"
-    res = client.post("/checkout/submit", json={"quote_id": q["quote_id"], "confirm_total_ils": q["total_ils"],
+    res = submit(client, "/checkout/submit", json={"quote_id": q["quote_id"], "confirm_total_ils": q["total_ils"],
                                                 "expected_cart_hash": q["cart_hash"], "dry_run": False, "confirm": True},
                       headers={**AUTH, "Idempotency-Key": "order-2"})
     assert res.status_code == 202
@@ -470,14 +471,14 @@ def test_place_order_outcomes(live, client, site, armed, response, status, code)
     key = f"order-{code}"
     req = {"quote_id": q["quote_id"], "confirm_total_ils": q["total_ils"], "expected_cart_hash": q["cart_hash"],
            "dry_run": False, "confirm": True}
-    res = client.post("/checkout/submit", json=req, headers={**AUTH, "Idempotency-Key": key})
+    res = submit(client, "/checkout/submit", json=req, headers={**AUTH, "Idempotency-Key": key})
     assert res.status_code == status, res.text
     body = res.json()
     assert (body.get("status") or body["error"]["code"]) == code
     assert body.get("order_id") is None
     # Whatever happened, neither the key nor the quote can place a second order.
-    client.post("/checkout/submit", json=req, headers={**AUTH, "Idempotency-Key": key})
-    other = client.post("/checkout/submit", json=req, headers={**AUTH, "Idempotency-Key": key + "-new"})
+    submit(client, "/checkout/submit", json=req, headers={**AUTH, "Idempotency-Key": key})
+    other = submit(client, "/checkout/submit", json=req, headers={**AUTH, "Idempotency-Key": key + "-new"})
     assert other.status_code == 409 and other.json()["error"]["code"] == "quote_consumed"
     assert site.orders_placed == 1
 
@@ -486,7 +487,7 @@ def test_blockers_stop_a_real_order(live, client, site, armed):
     _fill(site)
     q = _quote(client)
     site.checkout_state.update(cvv=True)
-    res = client.post("/checkout/submit", json={"quote_id": q["quote_id"], "confirm_total_ils": q["total_ils"],
+    res = submit(client, "/checkout/submit", json={"quote_id": q["quote_id"], "confirm_total_ils": q["total_ils"],
                                                 "expected_cart_hash": q["cart_hash"], "dry_run": False, "confirm": True},
                       headers={**AUTH, "Idempotency-Key": "blocked-1"})
     assert res.status_code == 409 and res.json()["error"]["code"] == "checkout_blocked"
@@ -498,7 +499,7 @@ def test_live_order_placement_is_off_by_default(live, client, site, monkeypatch)
     monkeypatch.setattr(config, "SHUFERSAL_CVV", "042")
     _fill(site)
     q = _quote(client)
-    res = client.post("/checkout/submit", json={"quote_id": q["quote_id"], "confirm_total_ils": q["total_ils"],
+    res = submit(client, "/checkout/submit", json={"quote_id": q["quote_id"], "confirm_total_ils": q["total_ils"],
                                                 "expected_cart_hash": q["cart_hash"], "dry_run": False, "confirm": True},
                       headers={**AUTH, "Idempotency-Key": "off-1"})
     assert res.status_code == 403 and res.json()["error"]["code"] == "live_checkout_disabled"
@@ -536,7 +537,7 @@ def test_watched_run_opens_visible_browser_and_returns_or_s_order(live, client, 
     site.checkout_state_sequence = [{"reauth": True}, {"reauth": True}]  # Or types the SMS code
     site.checkout_state.update(cvv=True)  # PayMe card field: Or handles it
     site.confirm_on_url_reads = 3          # ...then clicks place-order
-    res = client.post("/checkout/submit", json=_real(q, watched=True), headers={**AUTH, "Idempotency-Key": "watch-1"})
+    res = submit(client, "/checkout/submit", json=_real(q, watched=True), headers={**AUTH, "Idempotency-Key": "watch-1"})
     assert res.status_code == 200, res.text
     body = res.json()
     assert body["status"] == "placed" and body["order_id"] == "987654321"
@@ -550,9 +551,9 @@ def test_watched_run_timeout_burns_key_and_quote(live, client, site, armed, watc
     monkeypatch.setattr(config, "WATCH_TIMEOUT_SECONDS", 0.05)
     _fill(site)
     q = _quote(client)
-    res = client.post("/checkout/submit", json=_real(q, watched=True), headers={**AUTH, "Idempotency-Key": "watch-2"})
+    res = submit(client, "/checkout/submit", json=_real(q, watched=True), headers={**AUTH, "Idempotency-Key": "watch-2"})
     assert res.status_code == 202 and res.json()["status"] == "handover_timeout" and res.json()["order_id"] is None
-    again = client.post("/checkout/submit", json=_real(q, watched=True), headers={**AUTH, "Idempotency-Key": "watch-3"})
+    again = submit(client, "/checkout/submit", json=_real(q, watched=True), headers={**AUTH, "Idempotency-Key": "watch-3"})
     assert again.json()["error"]["code"] == "quote_consumed"
     assert live._headless is True
 
@@ -561,7 +562,7 @@ def test_watched_dry_run_does_not_wait_or_place(live, client, site, watch_fast):
     _fill(site)
     q = _quote(client)
     site.confirm_on_url_reads = 0
-    res = client.post("/checkout/submit", json={**_real(q, watched=True), "dry_run": True, "confirm": False}, headers=AUTH)
+    res = submit(client, "/checkout/submit", json={**_real(q, watched=True), "dry_run": True, "confirm": False}, headers=AUTH)
     assert res.status_code == 200 and res.json()["status"] == "dry_run"
     assert site.orders_placed == 0
 
@@ -624,7 +625,7 @@ def test_failed_visible_relaunch_restores_headless_and_clears_flag(live, client,
         return await real_start(headless=headless, user_data_dir=user_data_dir)
 
     monkeypatch.setattr(live, "_start_live", start)
-    res = client.post("/checkout/submit", json=_real(q, watched=True), headers={**AUTH, "Idempotency-Key": "watch-fail"})
+    res = submit(client, "/checkout/submit", json=_real(q, watched=True), headers={**AUTH, "Idempotency-Key": "watch-fail"})
     assert res.status_code == 503
     assert live._checkout_active is False and live._is_alive()
     assert client.get("/cart", headers=AUTH).status_code == 200
@@ -636,9 +637,9 @@ def test_watched_run_blocks_when_total_is_unreadable(live, client, site, armed, 
     site.cost_summary = {"entries": [{"totalPrice": {"value": 1}}]}
     site.summary_total_text = "₪ שקלים חדשים"
     site.confirm_on_url_reads = 0
-    dry = client.post("/checkout/submit", json={**_real(q, watched=True), "dry_run": True, "confirm": False}, headers=AUTH)
+    dry = submit(client, "/checkout/submit", json={**_real(q, watched=True), "dry_run": True, "confirm": False}, headers=AUTH)
     assert any("order total" in b for b in dry.json()["blockers"])
-    res = client.post("/checkout/submit", json=_real(q, watched=True), headers={**AUTH, "Idempotency-Key": "watch-total"})
+    res = submit(client, "/checkout/submit", json=_real(q, watched=True), headers={**AUTH, "Idempotency-Key": "watch-total"})
     assert res.status_code == 409 and res.json()["error"]["code"] == "checkout_blocked"
 
 
@@ -655,7 +656,7 @@ def test_gated_dry_run_reads_the_cart_summary_total_and_stops(live, client, site
     site.checkout_gated = True
     q = _quote(client)
     cart_before = [dict(e) for e in site.cart]
-    res = client.post("/checkout/submit", json=_dry(q), headers=AUTH)
+    res = submit(client, "/checkout/submit", json=_dry(q), headers=AUTH)
     assert res.status_code == 200, res.text
     body = res.json()
     assert body["status"] == "dry_run" and body["order_id"] is None
@@ -677,7 +678,7 @@ def test_gated_watched_dry_run_has_no_blockers(live, client, site, watch_fast):
     _fill(site)
     site.checkout_gated = True
     q = _quote(client)
-    body = client.post("/checkout/submit", json=_dry(q, watched=True), headers=AUTH).json()
+    body = submit(client, "/checkout/submit", json=_dry(q, watched=True), headers=AUTH).json()
     assert body["status"] == "dry_run" and body["blockers"] == []
     assert body["site_total_ils"] == q["total_ils"]
     assert any("מעבר לקופה" in w for w in body["warnings"])
@@ -689,7 +690,7 @@ def test_gated_watched_order_is_handed_to_or_on_the_cart_summary(live, client, s
     site.checkout_gated = True
     q = _quote(client)
     site.confirm_on_url_reads = 3  # Or clicks through password, payment and place-order
-    res = client.post("/checkout/submit", json=_real(q, watched=True), headers={**AUTH, "Idempotency-Key": "gate-w"})
+    res = submit(client, "/checkout/submit", json=_real(q, watched=True), headers={**AUTH, "Idempotency-Key": "gate-w"})
     assert res.status_code == 200, res.text
     body = res.json()
     assert body["status"] == "placed" and body["order_id"] == "987654321"
@@ -701,7 +702,7 @@ def test_gated_unwatched_order_is_blocked(live, client, site, armed):
     _fill(site)
     site.checkout_gated = True
     q = _quote(client)
-    res = client.post("/checkout/submit", json=_real(q), headers={**AUTH, "Idempotency-Key": "gate-u"})
+    res = submit(client, "/checkout/submit", json=_real(q), headers={**AUTH, "Idempotency-Key": "gate-u"})
     assert res.status_code == 409 and res.json()["error"]["code"] == "checkout_blocked"
     assert site.orders_placed == 0
 
@@ -711,7 +712,7 @@ def test_cart_summary_total_drift_is_refused(live, client, site, armed, watch_fa
     site.checkout_gated = True
     q = _quote(client)
     site.summary_total_text = "999.99\n₪\nשקלים חדשים"
-    res = client.post("/checkout/submit", json=_dry(q, watched=True), headers=AUTH)
+    res = submit(client, "/checkout/submit", json=_dry(q, watched=True), headers=AUTH)
     assert res.status_code == 409 and res.json()["error"]["code"] == "total_drift"
 
 
@@ -721,7 +722,7 @@ def test_guest_cart_summary_page_blocks(live, client, site, watch_fast, monkeypa
     q = _quote(client)
     real = site.cart_summary_state
     monkeypatch.setattr(site, "cart_summary_state", lambda path: dict(real(path), loggedIn=False))
-    body = client.post("/checkout/submit", json=_dry(q, watched=True), headers=AUTH).json()
+    body = submit(client, "/checkout/submit", json=_dry(q, watched=True), headers=AUTH).json()
     assert any("logged-in" in b for b in body["blockers"])
 
 
@@ -731,10 +732,10 @@ def test_cart_summary_total_wins_over_checkout_cost_summary(live, client, site):
     which includes the fee, is the preflight source; costSummary is the fallback."""
     _fill(site)
     q = _quote(client)
-    body = client.post("/checkout/submit", json=_dry(q), headers=AUTH).json()
+    body = submit(client, "/checkout/submit", json=_dry(q), headers=AUTH).json()
     assert body["site_total_ils"] == q["total_ils"] and body["checks"]["site_total_source"] == "cart_summary"
     site.summary_total_text = "1.00 ₪"
-    res = client.post("/checkout/submit", json=_dry(_quote(client)), headers=AUTH)
+    res = submit(client, "/checkout/submit", json=_dry(_quote(client)), headers=AUTH)
     assert res.status_code == 409 and res.json()["error"]["code"] == "total_drift"
 
 
@@ -753,10 +754,10 @@ def test_parse_summary_total(text, expected):
 def test_old_key_with_new_quote_is_refused_not_replayed(live, client, site, armed):
     _fill(site)
     q1 = _quote(client)
-    first = client.post("/checkout/submit", json=_real(q1), headers={**AUTH, "Idempotency-Key": "reuse-1"})
+    first = submit(client, "/checkout/submit", json=_real(q1), headers={**AUTH, "Idempotency-Key": "reuse-1"})
     assert first.json()["status"] == "placed"
     q2 = _quote(client)
-    res = client.post("/checkout/submit", json=_real(q2), headers={**AUTH, "Idempotency-Key": "reuse-1"})
+    res = submit(client, "/checkout/submit", json=_real(q2), headers={**AUTH, "Idempotency-Key": "reuse-1"})
     assert res.status_code == 409 and res.json()["error"]["code"] == "idempotency_key_used"
     assert site.orders_placed == 1
 
@@ -780,7 +781,7 @@ def test_watched_handover_ignores_non_confirmation_pages(live, client, site, arm
     q = _quote(client)
     site.confirmation_url = "https://www.shufersal.co.il/online/he/checkout/confirm-delivery"
     site.confirm_on_url_reads = 0
-    res = client.post("/checkout/submit", json=_real(q, watched=True), headers={**AUTH, "Idempotency-Key": "watch-nc"})
+    res = submit(client, "/checkout/submit", json=_real(q, watched=True), headers={**AUTH, "Idempotency-Key": "watch-nc"})
     assert res.json()["status"] == "handover_timeout" and res.json()["order_id"] is None
 
 

@@ -15,6 +15,7 @@ from setup_checkout_cvv import set_local_cvv
 from security import generate_jwt_token, sanitize_log_message
 from idempotency import idempotency_store, quote_store
 from shufersal_driver import shufersal_driver
+from tests.submit import submit
 
 client = TestClient(app, raise_server_exceptions=False)
 TEST_JWT = generate_jwt_token(subject="remote-agent-tester", expires_days=30)
@@ -161,17 +162,17 @@ def test_checkout_quote_and_submit_drift_protection(monkeypatch):
     monkeypatch.setattr(shufersal_driver, "checkout", checkout)
 
     # An expected cart is mandatory and must match the quote.
-    assert client.post("/checkout/submit", json={"quote_id": quote_id, "confirm_total_ils": total},
+    assert submit(client, "/checkout/submit", json={"quote_id": quote_id, "confirm_total_ils": total},
                        headers=AUTH_HEADERS).status_code == 400
-    res = client.post("/checkout/submit", json={**base, "expected_cart_hash": "0" * 16}, headers=AUTH_HEADERS)
+    res = submit(client, "/checkout/submit", json={**base, "expected_cart_hash": "0" * 16}, headers=AUTH_HEADERS)
     assert res.status_code == 409 and res.json()["error"]["code"] == "cart_mismatch"
-    res = client.post("/checkout/submit", json={"quote_id": quote_id, "confirm_total_ils": total,
+    res = submit(client, "/checkout/submit", json={"quote_id": quote_id, "confirm_total_ils": total,
                                                 "expected_items": [{"product_id": "P12345", "qty": 1}]},
                       headers=AUTH_HEADERS)
     assert res.status_code == 200 and res.json()["status"] == "dry_run"
 
     # Default is a dry run: no key, no order id.
-    dry = client.post("/checkout/submit", json=base, headers=AUTH_HEADERS)
+    dry = submit(client, "/checkout/submit", json=base, headers=AUTH_HEADERS)
     assert dry.status_code == 200, dry.text
     assert dry.json()["status"] == "dry_run" and dry.json()["order_id"] is None
     assert checkout.await_args.kwargs["place_order"] is False
@@ -180,35 +181,35 @@ def test_checkout_quote_and_submit_drift_protection(monkeypatch):
     # card entry happens in the site's PayMe frame, which the service never fills.
     monkeypatch.setattr(config, "SHUFERSAL_CVV", "")
     calls = checkout.await_count
-    assert client.post("/checkout/submit", json={**real, "confirm": False},
+    assert submit(client, "/checkout/submit", json={**real, "confirm": False},
                        headers={**AUTH_HEADERS, "Idempotency-Key": "k0"}).json()["error"]["code"] == "confirmation_required"
-    assert client.post("/checkout/submit", json=real, headers=AUTH_HEADERS).json()["error"]["code"] == "idempotency_key_required"
+    assert submit(client, "/checkout/submit", json=real, headers=AUTH_HEADERS).json()["error"]["code"] == "idempotency_key_required"
     # Caller supplied payment secrets are rejected without reflecting them.
-    bad = client.post("/checkout/submit", json={**real, "cvv": "123"}, headers={**AUTH_HEADERS, "Idempotency-Key": "k2"})
+    bad = submit(client, "/checkout/submit", json={**real, "cvv": "123"}, headers={**AUTH_HEADERS, "Idempotency-Key": "k2"})
     assert bad.status_code == 400 and "123" not in bad.text
     assert checkout.await_count == calls
 
     # Drift -> 409 before order placement; the key is burned.
-    drift = client.post("/checkout/submit", json={**real, "confirm_total_ils": total + 10.0},
+    drift = submit(client, "/checkout/submit", json={**real, "confirm_total_ils": total + 10.0},
                         headers={**AUTH_HEADERS, "Idempotency-Key": "k3"})
     assert drift.status_code == 409 and drift.json()["error"]["code"] == "total_drift"
     calls = checkout.await_count
-    reuse = client.post("/checkout/submit", json=real, headers={**AUTH_HEADERS, "Idempotency-Key": "k3"})
+    reuse = submit(client, "/checkout/submit", json=real, headers={**AUTH_HEADERS, "Idempotency-Key": "k3"})
     # The same key replays the stored failure (code and message), without a re-run.
     assert reuse.status_code == 409 and reuse.json() == drift.json(), reuse.text
     assert reuse.headers.get("Idempotent-Replayed") == "true" and checkout.await_count == calls
 
     # The drift attempt consumed the quote: a new key on it is refused.
-    consumed = client.post("/checkout/submit", json=real, headers={**AUTH_HEADERS, "Idempotency-Key": "k3b"})
+    consumed = submit(client, "/checkout/submit", json=real, headers={**AUTH_HEADERS, "Idempotency-Key": "k3b"})
     assert consumed.status_code == 409 and consumed.json()["error"]["code"] == "quote_consumed"
     quote = client.post(f"/checkout/quote?delivery_slot_id={slot_id}", headers=AUTH_HEADERS).json()
     real = {**real, "quote_id": quote["quote_id"]}
-    ok = client.post("/checkout/submit", json=real, headers={**AUTH_HEADERS, "Idempotency-Key": "k4"})
+    ok = submit(client, "/checkout/submit", json=real, headers={**AUTH_HEADERS, "Idempotency-Key": "k4"})
     assert ok.status_code == 200, ok.text
     assert ok.json()["status"] == "placed" and ok.json()["order_id"].startswith("MOCK-")
     assert "cvv" not in checkout.await_args.kwargs
     calls = checkout.await_count
-    replay = client.post("/checkout/submit", json=real, headers={**AUTH_HEADERS, "Idempotency-Key": "k4"})
+    replay = submit(client, "/checkout/submit", json=real, headers={**AUTH_HEADERS, "Idempotency-Key": "k4"})
     assert replay.status_code == 200 and replay.json() == ok.json()
     assert checkout.await_count == calls  # the same key never submits twice
     # The cart is untouched by checkout.
