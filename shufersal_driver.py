@@ -1415,6 +1415,7 @@ class ShufersalDriver:
                  details: Optional[Dict[str, Any]] = None) -> APIException:
         """Before the place-order click: a clean failure, no order was placed."""
         self._ua_log(steps, f"stopped before placing the order: {code}")
+        logger.info(f"unattended checkout: block reason: {message[:300]}")
         return APIException(status_code=409, code=code, message=message, details=details)
 
     @staticmethod
