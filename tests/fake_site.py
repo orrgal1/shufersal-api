@@ -112,6 +112,12 @@ class FakeSite:
         self.three_ds_codes = []           # codes typed into the bank frame
         self.cart_change_on_checkout = False
         self.checkout_total_delta = 0.0    # the checkout page total differs from the cart summary
+        self.cartsummary_popups = []       # other popups after "מעבר לקופה" (must stop the run)
+        self.checkout_selected_slot = None # None: the slot selected via postHomeDeliverySlot
+        self.three_ds_form = "ok"          # ok | no_form | two_submits
+        self.benefit_close_safe = True     # the benefit popup's X is the plain aria-label="סגור" button
+        self.rotate_session_on_checkout_cart_read = False
+        self.closed_with = []              # selectors the driver reported clicking to close popups
 
     def expire_session(self):
         """The server forgets the session (idle timeout); takes effect on the next request."""
@@ -225,6 +231,9 @@ class FakeSite:
                         "sellingMethod": {"code": CATALOG[c]["selling"]}, "brandName": "x",
                         "stock": {"stockLevelStatus": {"code": "inStock"}}} for c in hits]
             return 200, url, json.dumps({"results": results})
+        if path == "/online/he/cart/miniCart/TOTAL" and self.rotate_session_on_checkout_cart_read and self.checkout_reauthed:
+            self.rotate_session_on_checkout_cart_read = False
+            self.session_id = f"sess-{int(self.session_id.split('-')[1]) + 1}"
         if path == "/online/he/cart/miniCart/TOTAL":
             if self.fail_reads_after_write > 0 and any(r[0] == "POST" for r in self.requests):
                 self.fail_reads_after_write -= 1
@@ -272,6 +281,9 @@ class FakeSite:
             self.orders_placed += 1
             self.place_order_query = q
             return 200, url, json.dumps(self.place_order_response)
+        if path == "/online/he/checkout/timeSlot/getSelectedTimeSlot":
+            code = self.checkout_selected_slot or self.selected_slot
+            return 200, url, json.dumps({"code": code} if code else {})
         if path == "/online/he/my-account":
             return 200, BASE + "/online/he/my-account/personal-area", "<html></html>"
         return 404, url, "not found"
@@ -286,6 +298,8 @@ class FakeSite:
         popups = []
         if ui["modal"] == "benefit":
             popups.append("creditBenefitProductModal")
+        if on_summary or ui["modal"] == "benefit":
+            popups += ui.get("summary_popups", [])
         if on_checkout:
             popups += ui["checkout_popups"]
         return {
@@ -303,7 +317,7 @@ class FakeSite:
         path = urlparse(page._url).path
         if sel == ".miglog-cart-summary-checkoutLink" and path.endswith("/cart/cartsummary"):
             ui.update(modal=None, sms_tab=False, sms_sent=False, sms_value="", otp_error=False, three_ds=False,
-                      error_popup=None, checkout_popups=[])
+                      error_popup=None, checkout_popups=[], summary_popups=list(self.cartsummary_popups))
             self.checkout_reauthed = False  # the re-auth is asked again for every checkout
             ui["modal"] = "benefit" if self.benefit_popup else ("pwd" if self.reauth_modal else None)
             if ui["modal"] is None:
@@ -362,22 +376,24 @@ class FakeSite:
             return True
         return False
 
-    def ui_dismiss(self, page):
-        closed = []
-        if self.ui["modal"] == "benefit":
-            closed.append("creditBenefitProductModal")
-            self.ui["modal"] = "pwd" if self.reauth_modal else None
-            if self.ui["modal"] is None:
-                self.checkout_reauthed = True
-                page._url = BASE + "/online/he/miglog-checkout"
-        if urlparse(page._url).path.endswith("/miglog-checkout") and self.ui["checkout_popups"]:
-            closed += self.ui["checkout_popups"]
-            self.ui["checkout_popups"] = []
-        return closed
+    def ui_close_benefit(self, page):
+        if self.ui["modal"] != "benefit" or not self.benefit_close_safe:
+            return None
+        self.ui["modal"] = "pwd" if self.reauth_modal else None
+        if self.ui["modal"] is None:
+            self.checkout_reauthed = True
+            page._url = BASE + "/online/he/miglog-checkout"
+        sel = '#creditBenefitProductModal button.btnClose[aria-label="סגור"]'
+        self.closed_with.append(sel)
+        return sel
 
     def three_ds_submit(self, page, code):
         if self.three_ds_inputs != 1:
             return f"inputs:{self.three_ds_inputs}"
+        if self.three_ds_form == "no_form":
+            return "no-form"
+        if self.three_ds_form == "two_submits":
+            return "no-submit:2"
         self.three_ds_codes.append(code)
         self.ui["three_ds"] = False
         if code == self.issuer_code:
@@ -493,11 +509,13 @@ class FakePage:
             return self.site.ui_click(self, args)
         if "/*ua-fill*/" in script:
             return self.site.ui_fill(self, args[0], args[1])
-        if "/*ua-dismiss*/" in script:
-            return self.site.ui_dismiss(self)
+        if "/*ua-close-benefit*/" in script:
+            return self.site.ui_close_benefit(self)
         if args is None and "miglog-cart-summary-totalprice" in script:
             return self.site.cart_summary_state(urlparse(self._url).path)
         if args is None and "miglog.account" in script:  # login marker set when the page loaded
+            if "/miglog-checkout" in self._url:
+                return None  # the Vue checkout page may not carry window.miglog.account
             return self.logged_in_marker
         if args is None:  # checkout page state probe
             state = dict(self.site.checkout_state)

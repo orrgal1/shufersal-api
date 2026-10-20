@@ -25,7 +25,7 @@ from typing import Any, Dict, List, Optional
 # States whose real-world outcome is not known: an order may or may not exist.
 # "placing" is written just before the place-order click, so a crash after the
 # click still blocks.
-UNRESOLVED_STATES = ("placing", "outcome_unknown", "placed_unconfirmed", "three_ds_required")
+UNRESOLVED_STATES = ("placing", "outcome_unknown", "placed_unconfirmed", "three_ds_required", "handover_timeout")
 
 
 class CheckoutLedger:
@@ -88,6 +88,19 @@ class CheckoutLedger:
         with self._lock:
             self._db().execute("UPDATE submissions SET state=?, updated_at=? WHERE idempotency_key=?",
                                (state, now, key))
+
+    def begin_placing(self, key: str) -> List[str]:
+        """Right before the place-order click: atomically re-checks that no OTHER
+        attempt is unresolved and marks this one "placing". Returns the blocking
+        keys (empty = marked, go ahead)."""
+        now = datetime.now(timezone.utc).isoformat()
+        with self._lock:
+            others = [u["idempotency_key"] for u in self.unresolved() if u["idempotency_key"] != key]
+            if others:
+                return others
+            self._db().execute("UPDATE submissions SET state='placing', updated_at=? WHERE idempotency_key=?",
+                               (now, key))
+            return []
 
     def unresolved(self) -> List[Dict[str, Any]]:
         marks = ",".join("?" for _ in UNRESOLVED_STATES)

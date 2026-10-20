@@ -58,16 +58,146 @@ def test_full_unattended_path_with_3ds(ua, client, site, caplog):
     assert main.checkout_ledger.unresolved() == []
 
 
-def test_unattended_without_3ds_and_with_cvv_and_checkout_popup(ua, client, site, caplog):
+def test_unattended_without_3ds_and_with_cvv(ua, client, site, caplog):
     caplog.set_level(logging.INFO)
     site.checkout_cvv_field = True
-    site.checkout_popups = ["phoneCheckModal"]
     q = _quote(client)
     res = _submit(client, q, "ua-2")
     assert res.status_code == 200 and res.json()["status"] == "placed", res.text
     assert site.ui["cvv_value"] == "042"
     assert site.place_clicks == 1
     _no_secrets(caplog, res, site)
+
+
+def test_benefit_popup_closed_only_by_its_exact_x_and_logged(ua, client, site, caplog):
+    caplog.set_level(logging.INFO)
+    q = _quote(client)
+    res = _submit(client, q, "ua-x")
+    assert res.json()["status"] == "placed"
+    sel = '#creditBenefitProductModal button.btnClose[aria-label="סגור"]'
+    assert site.closed_with == [sel] and sel in caplog.text
+
+
+@pytest.mark.parametrize("where", ["cartsummary", "checkout"])
+def test_any_other_popup_stops_before_the_click_without_burning_placing(ua, client, site, where):
+    if where == "cartsummary":
+        site.cartsummary_popups = ["orderUpdatableModal"]
+    else:
+        site.checkout_popups = ["phoneCheckModal"]
+    q = _quote(client)
+    res = _submit(client, q, f"ua-pop-{where}")
+    assert res.status_code == 409 and res.json()["error"]["code"] == "checkout_blocked", res.text
+    assert site.place_clicks == 0 and len(site.cart) == 2
+    assert main.checkout_ledger.unresolved() == []
+    assert main.checkout_ledger.get(f"ua-pop-{where}")["state"] == "failed:checkout_blocked"
+
+
+def test_benefit_popup_without_a_safe_x_stops(ua, client, site):
+    site.benefit_close_safe = False
+    q = _quote(client)
+    res = _submit(client, q, "ua-unsafe-x")
+    assert res.json()["error"]["code"] == "checkout_blocked"
+    assert site.ui["sms_sent"] is False and site.place_clicks == 0
+
+
+def test_checkout_slot_must_match_the_quote(ua, client, site):
+    q = _quote(client)
+    site.checkout_selected_slot = "148340771"
+    res = _submit(client, q, "ua-slot")
+    assert res.status_code == 409 and res.json()["error"]["code"] == "checkout_blocked"
+    assert "slot" in res.json()["error"]["message"] and site.place_clicks == 0
+
+
+def test_checkout_cart_check_does_not_need_the_login_marker(ua, client, site):
+    # The fake checkout page has no window.miglog.account; the check must not reload home.
+    q = _quote(client)
+    loads = site.page_loads
+    res = _submit(client, q, "ua-m5")
+    assert res.json()["status"] == "placed"
+    assert any("cart re-verified" in s for s in res.json()["checks"]["unattended_steps"])
+    assert site.page_loads - loads <= 3  # /checkout probe, cart summary; no home reload on checkout
+
+
+def test_session_change_during_checkout_cart_read_stops(ua, client, site):
+    q = _quote(client)
+    site.rotate_session_on_checkout_cart_read = True
+    res = _submit(client, q, "ua-sess")
+    assert res.json()["error"]["code"] == "checkout_blocked" and site.place_clicks == 0
+
+
+def test_second_queued_order_does_not_click_after_first_became_unknown(ua, client, site):
+    """H2: B claimed while A was still running (no block yet); A ends unknown;
+    B must not click."""
+    ledger = main.checkout_ledger
+    q_a = _quote(client)
+    assert ledger.claim("A", q_a["quote_id"]) is None
+    ledger.finish("A", "outcome_unknown", 202, {})  # A finished ambiguous while B waited
+    q_b = _quote(client)
+    assert ledger.get("B") is None
+    # Simulate B having passed claim() before A's outcome: claim directly bypassing the block.
+    ledger._db().execute("INSERT INTO submissions (idempotency_key, quote_id, state, created_at, updated_at)"
+                         " VALUES ('B', ?, 'in_progress', 'x', 'x')", (q_b["quote_id"],))
+    res = run_driver_checkout(ua, q_b, "B")
+    assert res == "order_outcome_unresolved" and site.place_clicks == 0
+
+
+def run_driver_checkout(drv, q, key):
+    import asyncio
+    from security import APIException
+    try:
+        asyncio.run(drv.checkout(slot_id=q["slot"]["id"], expected_cart_hash=q["cart_hash"],
+                                 confirm_total_ils=q["total_ils"], place_order=True, unattended=True,
+                                 on_place_order=lambda: main._begin_placing(key)))
+    except APIException as e:
+        return e.code
+    return "no-error"
+
+
+def test_guard_rechecks_checkout_active_after_lock(live):
+    import asyncio
+    from security import APIException
+
+    async def scenario():
+        await live._lock.acquire()          # a checkout holds the lock...
+        waiter = asyncio.ensure_future(live.get_cart())
+        await asyncio.sleep(0)
+        live._checkout_active = True         # ...and is marked active after the waiter queued
+        live._lock.release()
+        try:
+            await waiter
+        except APIException as e:
+            return e.code
+        finally:
+            live._checkout_active = False
+    assert asyncio.run(scenario()) == "checkout_in_progress"
+
+
+@pytest.mark.parametrize("mode", ["no_form", "two_submits"])
+def test_3ds_submit_only_inside_the_form_with_one_submit(ua, client, site, mode):
+    site.after_click = "3ds"
+    site.three_ds_form = mode
+    q = _quote(client)
+    res = _submit(client, q, f"ua-3dsform-{mode}")
+    assert res.json()["status"] == "outcome_unknown" and site.three_ds_codes == []
+
+
+def test_handover_timeout_blocks_further_orders(ua, client, site):
+    main.checkout_ledger.claim("w", "qw")
+    main.checkout_ledger.finish("w", "handover_timeout", 202, {})
+    res = _submit(client, _quote(client), "ua-after-timeout")
+    assert res.json()["error"]["code"] == "order_outcome_unresolved"
+
+
+def test_ledger_default_path_is_absolute(monkeypatch):
+    import os
+    import subprocess
+    import sys
+    env = {k: v for k, v in os.environ.items() if k != "SHUFERSAL_CHECKOUT_LEDGER"}
+    out = subprocess.run([sys.executable, "-c", "import sys; sys.path.insert(0, %r); import config; "
+                          "print(config.CHECKOUT_LEDGER)" % os.getcwd()], cwd="/", env=env,
+                         capture_output=True, text=True)
+    path = out.stdout.strip()
+    assert os.path.isabs(path) and path == os.path.join(os.getcwd(), ".runtime", "checkout_ledger.sqlite3")
 
 
 def test_unattended_needs_both_flags(monkeypatch, ua, client, site):
@@ -257,5 +387,10 @@ def test_issuer_text_parsing_matches_real_format():
             "הקוד שלך להשלמת העסקה הינו 123456\nתמיד לשירותך, ישראכרט\n\n"
             "Код для завершения оплаты 123456.")
     assert check_issuer_code(text, 447.06, "8277") == {"ok": True, "code": "123456"}
+    # All three of amount, card digits and merchant must be present.
+    assert not check_issuer_code(text.replace("בסכום 447.06 ILS", "בסכום ILS"), 447.06, "8277")["ok"]
+    assert not check_issuer_code(text.replace("בכרטיסך 8277", "בכרטיס"), 447.06, "8277")["ok"]
+    no_merchant = "הקוד שלך להשלמת העסקה הינו 123456"
+    assert not check_issuer_code(no_merchant, 447.06, "8277")["ok"]
     assert not check_issuer_code(text, 447.00, "8277")["ok"]
     assert not check_issuer_code(text, 447.06, "1111")["ok"]

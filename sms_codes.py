@@ -6,7 +6,7 @@ A code is accepted only from a message that
   - is at most SMS_CODE_MAX_AGE_SECONDS old,
   - comes from the expected sender,
   - for 3-D Secure: names the expected card, the expected amount and a
-    Shufersal merchant when the text includes them.
+    Shufersal merchant (all three must be present and match).
 Codes are never logged or returned anywhere except to the caller that types them.
 """
 import asyncio
@@ -78,15 +78,16 @@ def check_issuer_code(text: str, amount: Optional[float], last4: Optional[str]) 
     code = _first(ISSUER_CODE_RES, text or "")
     if not code:
         return {"ok": False, "reason": "no issuer code phrase in the text"}
+    # Amount, card digits and merchant must all be present AND match.
     got_amount = _num(_first(ISSUER_AMOUNT_RES, text))
-    if got_amount is not None and (amount is None or abs(got_amount - amount) > 0.01):
-        return {"ok": False, "reason": f"amount {got_amount} does not match the order total"}
+    if got_amount is None or amount is None or abs(got_amount - amount) > 0.01:
+        return {"ok": False, "reason": f"amount {got_amount} missing or not the order total"}
     got_last4 = _first(ISSUER_LAST4_RES, text)
-    if got_last4 is not None and last4 and got_last4 != last4:
-        return {"ok": False, "reason": "card digits do not match the saved card"}
+    if got_last4 is None or not last4 or got_last4 != last4:
+        return {"ok": False, "reason": "card digits missing or not the saved card"}
     merchant = _first(ISSUER_MERCHANT_RES, text)
-    if merchant is not None and not any(h in merchant.lower() for h in config.THREE_DS_MERCHANT_HINTS):
-        return {"ok": False, "reason": f"merchant '{merchant[:40]}' is not Shufersal"}
+    if merchant is None or not any(h in merchant.lower() for h in config.THREE_DS_MERCHANT_HINTS):
+        return {"ok": False, "reason": f"merchant '{(merchant or '')[:40]}' missing or not Shufersal"}
     return {"ok": True, "code": code}
 
 

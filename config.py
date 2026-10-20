@@ -51,7 +51,8 @@ SHUFERSAL_CVV = os.getenv("SHUFERSAL_CVV", "")
 LIVE_CHECKOUT_ENABLED = os.getenv("SHUFERSAL_LIVE_CHECKOUT_ENABLED", "false").strip().lower() in ("true", "1", "yes")
 
 # Durable record of every order-submission Idempotency-Key (survives restarts).
-CHECKOUT_LEDGER = os.getenv("SHUFERSAL_CHECKOUT_LEDGER", "./.runtime/checkout_ledger.sqlite3")
+CHECKOUT_LEDGER = os.getenv("SHUFERSAL_CHECKOUT_LEDGER",
+                            str(Path(__file__).resolve().parent / ".runtime" / "checkout_ledger.sqlite3"))
 
 # Watched checkout: the browser is relaunched visible for the checkout step and
 # the service waits this long for Or to finish payment and place the order.

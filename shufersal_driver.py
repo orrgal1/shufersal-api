@@ -184,6 +184,10 @@ class ShufersalDriver:
             raise APIException(status_code=409, code="checkout_in_progress",
                                message="A checkout is in progress; retry when it has finished.")
         async with self._lock:
+            # A checkout may have started while this call waited for the lock.
+            if self._checkout_active:
+                raise APIException(status_code=409, code="checkout_in_progress",
+                                   message="A checkout is in progress; retry when it has finished.")
             yield
 
     def _mark_dead(self, reason: str, owner: Any = None):
@@ -546,10 +550,11 @@ class ShufersalDriver:
             raise _upstream(f"Cart request returned HTTP {status}.")
         return count, subtotal, html
 
-    async def _read_cart(self) -> Dict[str, Any]:
+    async def _read_cart(self, raw: Optional[Tuple[int, float, str]] = None) -> Dict[str, Any]:
         """Reads the real cart: site item count and subtotal from the mini-cart,
-        entries (exact entry numbers, codes, quantities) from the cart HTML."""
-        count, subtotal, html = await self._session_read(
+        entries (exact entry numbers, codes, quantities) from the cart HTML.
+        `raw` is a (count, subtotal, html) read the caller already verified."""
+        count, subtotal, html = raw if raw is not None else await self._session_read(
             self._read_cart_raw, lambda r: r[0] == 0 and not (parse_cart_line_count(r[2]) or 0))
         try:
             entries = parse_cart_entries(html)
@@ -1142,6 +1147,8 @@ class ShufersalDriver:
         if unattended:
             return dict(result, **(await self._unattended_place(summary, confirm_total_ils, result, on_place_order)))
 
+        if on_place_order:
+            on_place_order()  # atomic ledger re-check + "placing" mark; raises -> no request sent
         jwt = ""
         if page_state.get("threeDS"):
             try:
@@ -1232,17 +1239,21 @@ class ShufersalDriver:
         el.dispatchEvent(new Event('change', {bubbles: true}));
         return true;
     }"""
-    # Closes every blocking popup except the re-auth modal by its close control only.
-    UA_DISMISS_JS = """() => { /*ua-dismiss*/
+    # The only popup ever closed: the credit-benefit offer, by its own X
+    # (live markup 2026-10-20: <button type="button" aria-label="סגור" class="btnClose">
+    # in #creditBenefitProductModal's header). Its "המשך לתשלום" button adds
+    # items, so nothing inside a form or with add/continue wording is clicked.
+    UA_CLOSE_BENEFIT_JS = """() => { /*ua-close-benefit*/
         const vis = (e) => !!e && e.getClientRects().length > 0 && getComputedStyle(e).visibility !== 'hidden';
-        const closed = [];
-        for (const m of document.querySelectorAll('.modal')) {
-            if (!vis(m) || m.id === 'forgottenPwdModal' || m.classList.contains('modalFromSide')
-                || m.classList.contains('creditCardOtpPopup') || m.classList.contains('generalErrorChat')) continue;
-            const btn = [...m.querySelectorAll('.btnClose, [data-dismiss="modal"], button.close')].find(vis);
-            if (btn) { btn.click(); closed.push(m.id || String(m.className).slice(0, 60)); }
-        }
-        return closed;
+        const m = document.querySelector('#creditBenefitProductModal');
+        if (!vis(m)) return null;
+        const btns = [...m.querySelectorAll('button.btnClose[aria-label="סגור"]')].filter(vis);
+        if (btns.length !== 1) return null;
+        const b = btns[0];
+        const words = (b.textContent || '') + ' ' + (b.getAttribute('aria-label') || '');
+        if (b.closest('form') || /המשך|הוסף|הוספה|לתשלום|continue|add/i.test(words) || words.trim() !== 'סגור') return null;
+        b.click();
+        return '#creditBenefitProductModal button.btnClose[aria-label="סגור"]';
     }"""
     # Inside the bank's 3-D Secure frame: the single visible code input.
     UA_FRAME_OTP_JS = """() => { /*ua-3ds-probe*/
@@ -1257,16 +1268,20 @@ class ShufersalDriver:
             && ['text', 'tel', 'password', 'number', ''].includes((e.getAttribute('type') || '').toLowerCase()));
         if (inputs.length !== 1) return 'inputs:' + inputs.length;
         const el = inputs[0];
+        const form = el.form;
+        if (!form) return 'no-form';
+        const bad = /ביטול|בטל|cancel|שלח שוב|שליחה חוזרת|קוד חדש|resend|again/i;
+        const label = (b) => ((b.textContent || '') + ' ' + (b.value || '') + ' ' + (b.getAttribute('aria-label') || '')).trim();
+        const cands = [...form.querySelectorAll('button, input[type=submit]')].filter(b => vis(b) && !b.disabled && !bad.test(label(b)));
+        const submits = cands.filter(b => (b.getAttribute('type') || (b.tagName === 'BUTTON' ? 'submit' : '')).toLowerCase() === 'submit');
+        const explicit = submits.filter(b => (b.getAttribute('type') || '').toLowerCase() === 'submit');
+        const pick = explicit.length === 1 ? explicit[0] : (submits.length === 1 ? submits[0] : null);
+        if (!pick) return 'no-submit:' + submits.length;
         el.focus(); el.value = code;
         el.dispatchEvent(new Event('input', {bubbles: true}));
         el.dispatchEvent(new Event('change', {bubbles: true}));
-        const form = el.form;
-        const cands = [...(form || document).querySelectorAll('button, input[type=submit]')].filter(b => vis(b) && !b.disabled);
-        const btn = cands.find(b => (b.type || '').toLowerCase() === 'submit')
-            || cands.find(b => /אישור|שלח|המשך|submit|continue|confirm|verify/i.test(b.textContent || b.value || ''));
-        if (btn) { btn.click(); return 'clicked'; }
-        if (form) { form.requestSubmit ? form.requestSubmit() : form.submit(); return 'submitted'; }
-        return 'no-submit';
+        pick.click();
+        return 'clicked';
     }"""
 
     def _ua_log(self, steps: List[str], step: str):
@@ -1318,6 +1333,19 @@ class ShufersalDriver:
             raise self._ua_fail(steps, "reauth_failed", "The re-auth confirm button stayed disabled.")
         self._ua_log(steps, "re-auth: SMS code entered and confirmed")
 
+    async def _ua_close_benefit_popup(self, steps: List[str], popups: List[str], dismissed: int):
+        """Closes the credit-benefit popup by its exact X; any other popup stops
+        the run before the place-order click."""
+        others = [p for p in popups if p != "creditBenefitProductModal"]
+        if others:
+            raise self._ua_fail(steps, "checkout_blocked", f"An unexpected popup is open: {others}.")
+        if dismissed >= 3:
+            raise self._ua_fail(steps, "checkout_blocked", "The credit-benefit popup does not close.")
+        clicked = await self.page.evaluate(self.UA_CLOSE_BENEFIT_JS)
+        if not clicked:
+            raise self._ua_fail(steps, "checkout_blocked", "The credit-benefit popup has no safe close button.")
+        self._ua_log(steps, f"closed the credit-benefit popup via {clicked}")
+
     async def _ua_reach_checkout(self, steps: List[str]) -> Dict[str, Any]:
         """Cart summary -> "מעבר לקופה" -> popups -> SMS re-auth -> checkout page."""
         await self.page.goto(config.SHUFERSAL_BASE_URL + BASE + "/cart/cartsummary",
@@ -1351,12 +1379,26 @@ class ShufersalDriver:
                 reauthed = True
                 continue
             if state.get("popups"):
-                if dismissed >= 5:
-                    raise self._ua_fail(steps, "checkout_blocked", f"Popups keep opening: {state['popups']}.")
-                closed = await self.page.evaluate(self.UA_DISMISS_JS)
+                await self._ua_close_benefit_popup(steps, state["popups"], dismissed)
                 dismissed += 1
-                self._ua_log(steps, f"closed popup(s) {closed or state['popups']}")
         raise self._ua_fail(steps, "checkout_unreachable", "The checkout page did not open in time.")
+
+    async def _ua_verify_slot(self, steps: List[str], summary: Dict[str, Any]):
+        """The checkout page's selected delivery slot must be the quoted slot.
+        Endpoint from the checkout JS (TimeSlot service: x="/checkout/timeSlot",
+        selectedTimeSlot -> getSelectedTimeSlot?...; its answer's `code` is the slot)."""
+        want = str((summary.get("slot") or {}).get("id") or "")
+        status, _, text = await self._fetch(
+            f"{BASE}/checkout/timeSlot/getSelectedTimeSlot?sourceOfSupply=DIRECT&vendorCode=&region="
+            "&amount=1.0&supportsShipping=true")
+        try:
+            got = str((json.loads(text) or {}).get("code") or "") if status == 200 else ""
+        except (ValueError, AttributeError):
+            got = ""
+        if not want or got != want:
+            raise self._ua_fail(steps, "checkout_blocked",
+                                f"The checkout page's delivery slot ({got or 'unreadable'}) is not the quoted slot ({want}).")
+        self._ua_log(steps, f"delivery slot verified ({got})")
 
     async def _unattended_place(self, summary, confirm_total_ils, result, on_place_order) -> Dict[str, Any]:
         from sms_codes import SmsCodeError
@@ -1378,19 +1420,28 @@ class ShufersalDriver:
                 if state.get("errorPopup"):
                     raise self._ua_fail(steps, "checkout_blocked", f"The checkout page shows an error: {state['errorPopup']}")
                 if state.get("popups"):
-                    closed = await self.page.evaluate(self.UA_DISMISS_JS)
-                    self._ua_log(steps, f"closed popup(s) on the checkout page {closed or state['popups']}")
-                elif state.get("placeButton"):
+                    raise self._ua_fail(steps, "checkout_blocked",
+                                        f"An unexpected popup is open on the checkout page: {state['popups']}.")
+                if state.get("placeButton"):
                     break
                 if time.monotonic() > deadline:
                     raise self._ua_fail(steps, "checkout_blocked", "The checkout page's place-order button did not appear.")
                 await self._ua_sleep()
             # Re-verify on the checkout page itself: the cart and the site's own total.
-            self._page_session = await self._session_id()
-            self._page_loaded_at = time.monotonic()
-            cart = await self._get_cart_unlocked()
-            if cart["cart_hash"] != summary["cart_hash"]:
+            # The Vue checkout page may not carry window.miglog.account, so the
+            # usual login-marker check (which would reload the home page) is not
+            # used here: the read must run in one unchanged session and the
+            # cart must hash-match the quoted cart (a guest cart cannot).
+            sid_before = await self._session_id()
+            raw = await self._read_cart_raw()
+            sid_after = await self._session_id()
+            if not sid_before or sid_before != sid_after:
+                raise self._ua_fail(steps, "checkout_blocked", "The site session changed while re-reading the cart.")
+            cart = await self._read_cart(raw=raw)
+            if cart["cart_hash"] != summary["cart_hash"] or not cart.get("lines_complete", False):
                 raise self._ua_fail(steps, "cart_mismatch", "The cart changed on the way to the checkout page.")
+            self._ua_log(steps, "cart re-verified on the checkout page")
+            await self._ua_verify_slot(steps, summary)
             status, _, text = await self._fetch(f"{BASE}/checkout/costSummary/direct")
             try:
                 checkout_total = extract_site_total(json.loads(text)) if status == 200 else None
@@ -1424,7 +1475,13 @@ class ShufersalDriver:
 
         # ---------- The place-order click: at most once; from here every failure is "unknown" ----------
         if on_place_order:
-            on_place_order()
+            # Atomically re-checks the ledger for unresolved attempts and marks
+            # this one "placing"; raises (no click) if anything is unresolved.
+            try:
+                on_place_order()
+            except APIException as e:
+                self._ua_log(steps, f"stopped before placing the order: {e.code}")
+                raise
         self._ua_log(steps, "clicking the place-order button (once)")
         try:
             clicked = await self.page.evaluate(self.UA_CLICK_JS, "a.btnConfirm")
@@ -1472,7 +1529,7 @@ class ShufersalDriver:
         outcome = await frame.evaluate(self.UA_FRAME_SUBMIT_JS, code)
         code = None
         self._ua_log(steps, f"3-D Secure: code entered ({outcome})")
-        return outcome in ("clicked", "submitted")
+        return outcome == "clicked"
 
     async def _ua_await_outcome(self, steps, warnings, base, summary, total) -> Dict[str, Any]:
         """After the click: handle 3-D Secure once, then read the order number

@@ -310,6 +310,17 @@ async def create_checkout_quote(
     log_mutation("POST", "/checkout/quote", 200, idempotency_key, {"quote_id": quote["quote_id"]})
     return CheckoutQuoteResponse(**quote)
 
+def _begin_placing(key: str):
+    """Called by the driver right before the place-order click (under the driver
+    lock): refuses, without clicking, if another attempt became unresolved while
+    this one waited."""
+    blocking = checkout_ledger.begin_placing(key)
+    if blocking:
+        raise APIException(status_code=409, code="order_outcome_unresolved",
+                           message="An earlier order attempt has an unknown outcome; no further orders until Or "
+                                   "checks the site and runs `checkout_ledger.py resolve <key> placed|not_placed`.")
+
+
 @app.post("/checkout/submit", response_model=CheckoutSubmitResponse)
 async def submit_checkout(
     payload: CheckoutSubmitRequest,
@@ -393,7 +404,7 @@ async def submit_checkout(
             place_order=place_order,
             watched=payload.watched,
             unattended=unattended,
-            on_place_order=(lambda: checkout_ledger.mark(idempotency_key, "placing")) if place_order else None,
+            on_place_order=(lambda: _begin_placing(idempotency_key)) if place_order else None,
         )
     except APIException as exc:
         if place_order:
