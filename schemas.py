@@ -50,6 +50,17 @@ class CartItem(BaseModel):
     # None when the site price could not be read; never a silent 0.
     unit_price_ils: Optional[float] = None
     line_total_ils: Optional[float] = None
+    # The site's stock state for the line: False = out of stock (the checkout's
+    # missing-products popup will stop an unattended order), None = not checked
+    # or unreadable. Only GET /cart checks it.
+    available: Optional[bool] = None
+
+class UnavailableItem(BaseModel):
+    line_id: Optional[str] = None
+    product_id: str
+    name: str
+    qty: Optional[float] = None
+    reason: str = "out_of_stock"
 
 class CartResponse(BaseModel):
     items: List[CartItem]
@@ -63,6 +74,10 @@ class CartResponse(BaseModel):
     total_includes_delivery: bool = False
     prices_complete: bool = True
     cart_hash: Optional[str] = None
+    # Lines the site shows as out of stock (GET /cart only; empty otherwise).
+    unavailable_items: List[UnavailableItem] = []
+    # False when some line's stock state could not be read (its available is None).
+    availability_complete: bool = True
 
 class CartItemAddRequest(BaseModel):
     product_id: str
@@ -135,6 +150,10 @@ class CheckoutQuoteResponse(BaseModel):
     slot: Optional[Dict[str, Any]] = None
     payment: Optional[Dict[str, Any]] = None
     prices_complete: bool = True
+    # Out-of-stock lines: an unattended order stops at the checkout's
+    # missing-products popup (409 products_unavailable) while any are in the cart.
+    unavailable_items: List[UnavailableItem] = []
+    availability_complete: bool = True
     total_is_estimate: bool = True
 
 class ExpectedItem(BaseModel):

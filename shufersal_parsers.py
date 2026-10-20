@@ -386,3 +386,69 @@ def classify_place_order(data: Any) -> Dict[str, Any]:
         first = data[0]
         return {"outcome": "rejected", "code": str(first.get("errorCode") or first.get("code") or first.get("type") or "unknown")}
     return {"outcome": "unknown"}
+
+
+# ==================== Availability ====================
+
+# Product page (/p/P_<code>), live markup 2026-10-20: the details block carries
+# the stock state as a class, e.g. <div class="productDetails nonFood
+# miglog-prod-outOfStock notOverlay"> for P_749 (out of stock) and
+# "miglog-prod-inStock" for P_22. The "חסר במלאי" text is in every page and
+# every cart line (shown by CSS), so the text alone means nothing.
+_PAGE_STOCK_RE = re.compile(r'class="[^"]*\bproductDetails\b[^"]*\bmiglog-prod-(inStock|outOfStock|lowStock)\b')
+
+
+def parse_product_page_stock(html: Any) -> Optional[bool]:
+    """True (in stock / low stock), False (out of stock) or None (not found or contradictory)."""
+    if not isinstance(html, str):
+        return None
+    states = set(_PAGE_STOCK_RE.findall(html))
+    if len(states) != 1:
+        return None
+    return states.pop() != "outOfStock"
+
+
+# Recommendation types the checkout's missing-products popup (#missingProducts)
+# lists as lines that will not be supplied as ordered (checkout JS 2026-10-20:
+# oos = type OUT_OF_STOCK, day = DELIVERY_DAY_WARNING-like "not sold on <day>").
+# EXPIRING_PROMOTION entries are promotions, not products, and are skipped.
+_NOT_PRODUCT_TYPES = {"EXPIRING_PROMOTION"}
+
+
+def parse_checkout_recommendations(data: Any) -> List[Dict[str, Any]]:
+    """GET /checkout/recommendation/direct (only answers on the checkout page;
+    elsewhere HTTP 400) -> the cart lines the site says it cannot supply.
+    Live shape 2026-10-20:
+      [{"type":"OUT_OF_STOCK","count":1,"products":[{"product":{"code":"P_749",
+        "name":"פלפל שישקה מתוק","cartStatus":{"qty":0.5,"cartEntryNumber":3},...},
+        "replaceable":true}]}]
+    Raises ParseError on any other shape."""
+    if not isinstance(data, list):
+        raise ParseError("recommendations are not a list")
+    out: List[Dict[str, Any]] = []
+    seen = set()
+    for group in data:
+        if not isinstance(group, dict):
+            continue
+        kind = str(group.get("type") or "").upper()
+        if kind in _NOT_PRODUCT_TYPES:
+            continue
+        for p in group.get("products") or []:
+            if not isinstance(p, dict):
+                continue
+            prod = p.get("product") if isinstance(p.get("product"), dict) else p
+            code = clean_code(prod.get("code"))
+            if not code or (code, kind) in seen:
+                continue
+            seen.add((code, kind))
+            status = prod.get("cartStatus") if isinstance(prod.get("cartStatus"), dict) else {}
+            entry = status.get("cartEntryNumber")
+            out.append({
+                "product_id": code,
+                "name": (prod.get("name") or "").strip() or code,
+                "reason": kind.lower() or "unknown",
+                "qty": _num(status.get("qty")),
+                "line_id": str(entry) if entry is not None else None,
+                "replaceable": bool(p.get("replaceable")),
+            })
+    return out

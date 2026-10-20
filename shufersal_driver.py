@@ -22,8 +22,10 @@ from shufersal_parsers import (
     parse_cart_line_count,
     parse_home_delivery_slots,
     parse_minicart,
+    parse_checkout_recommendations,
     parse_order_number,
     parse_payment_method,
+    parse_product_page_stock,
     parse_search_results,
     parse_summary_total,
     public_payment,
@@ -88,6 +90,8 @@ class ShufersalDriver:
         self._page_loaded_at: float = 0.0
         from sms_codes import SmsCodeReader
         self.sms_reader = SmsCodeReader()
+        # product code -> (monotonic time, available: True/False/None)
+        self._stock_cache: Dict[str, Tuple[float, Optional[bool]]] = {}
 
         # Internal mock store used only when MOCK_MODE=True (tests/demo).
         self._mock_logged_in = True
@@ -662,8 +666,62 @@ class ShufersalDriver:
 
     async def _get_cart_unlocked(self) -> Dict[str, Any]:
         if config.MOCK_MODE:
-            return self._calculate_mock_cart()
-        return await self._read_cart()
+            cart = self._calculate_mock_cart()
+            for i in cart["items"]:
+                i.setdefault("available", True)
+            cart.update(unavailable_items=[], availability_complete=True)
+            return cart
+        cart = await self._read_cart()
+        await self._add_availability(cart)
+        return cart
+
+    # ---- stock (read-only) ----
+
+    STOCK_CACHE_SECONDS = 60
+    STOCK_CONCURRENCY = 6
+
+    async def _product_available(self, code: str) -> Optional[bool]:
+        """The site's stock state of one product: True, False (out of stock) or
+        None (unreadable). The search JSON omits out-of-stock products entirely
+        (live 2026-10-20: P_749 was missing from every search while its product
+        page said outOfStock), so a code the search returns as inStock is
+        available, and anything else is decided by the product page."""
+        cached = self._stock_cache.get(code)
+        if cached and time.monotonic() - cached[0] < self.STOCK_CACHE_SECONDS:
+            return cached[1]
+        available: Optional[bool] = None
+        try:
+            hit = find_exact(await self._search_json(code, 20), code)
+            if hit and hit.get("in_stock") is True:
+                available = True
+            else:
+                status, _, html = await self._fetch(f"{BASE}/p/{site_code(code)}")
+                available = parse_product_page_stock(html) if status == 200 else None
+        except APIException as e:
+            if e.status_code == 503:
+                raise
+            available = None
+        self._stock_cache[code] = (time.monotonic(), available)
+        return available
+
+    async def _add_availability(self, cart: Dict[str, Any]):
+        """Sets items[].available, unavailable_items and availability_complete."""
+        sem = asyncio.Semaphore(self.STOCK_CONCURRENCY)
+
+        async def one(code):
+            async with sem:
+                return await self._product_available(code)
+
+        codes = list(dict.fromkeys(i["product_id"] for i in cart["items"]))
+        states = dict(zip(codes, await asyncio.gather(*(one(c) for c in codes))))
+        unavailable = []
+        for i in cart["items"]:
+            i["available"] = states.get(i["product_id"])
+            if i["available"] is False:
+                unavailable.append({"line_id": i["line_id"], "product_id": i["product_id"], "name": i["name"],
+                                    "qty": i["qty"], "reason": "out_of_stock"})
+        cart["unavailable_items"] = unavailable
+        cart["availability_complete"] = all(i["available"] is not None for i in cart["items"])
 
     # ---- primitives (mock or live) ----
 
@@ -931,7 +989,10 @@ class ShufersalDriver:
                                message=f"Delivery slot {slot_id} is not offered or not available.")
         payment = await self._get_payment_method_unlocked()
         return {
-            "items": [{k: i[k] for k in ("product_id", "name", "qty", "unit_price_ils", "line_total_ils")} for i in cart["items"]],
+            "items": [{k: i.get(k) for k in ("product_id", "name", "qty", "unit_price_ils", "line_total_ils", "available")}
+                      for i in cart["items"]],
+            "unavailable_items": cart.get("unavailable_items") or [],
+            "availability_complete": cart.get("availability_complete", True),
             "item_count": cart["item_count"],
             "cart_hash": cart["cart_hash"],
             "prices_complete": cart["prices_complete"],
@@ -1255,6 +1316,24 @@ class ShufersalDriver:
         b.click();
         return '#creditBenefitProductModal button.btnClose[aria-label="סגור"]';
     }"""
+    # The checkout's missing-products popup (live 2026-10-20, Vue, id
+    # "missingProducts", data-backdrop="static": no X, no Escape). Per missing
+    # line <li data-product-code="P_749"> with .productName and the buttons
+    # "להחלפה" (swap in a substitute) / "לא תודה" (drop the line), plus a bottom
+    # "המשך לתשלום" enabled once every line is decided. Every button changes
+    # the order, so the run only READS it and stops.
+    UA_MISSING_JS = """() => { /*ua-missing*/
+        const vis = (e) => !!e && e.getClientRects().length > 0 && getComputedStyle(e).visibility !== 'hidden';
+        const m = [...document.querySelectorAll('#missingProducts')].find(vis);
+        if (!m) return null;
+        const items = [...m.querySelectorAll('[data-product-code]')].map(li => ({
+            code: li.getAttribute('data-product-code'),
+            name: ((li.querySelector('.productName') || {}).textContent || '').trim(),
+        }));
+        const buttons = [...m.querySelectorAll('button')].filter(vis).map(b => (b.textContent || '').trim()).filter(Boolean);
+        const text = (m.innerText || '').replace(/\\s+/g, ' ').trim().slice(0, 400);
+        return {items, buttons: [...new Set(buttons)], text};
+    }"""
     # Inside the bank's 3-D Secure frame: the single visible code input.
     UA_FRAME_OTP_JS = """() => { /*ua-3ds-probe*/
         const vis = (e) => !!e && e.getClientRects().length > 0 && getComputedStyle(e).visibility !== 'hidden';
@@ -1295,10 +1374,11 @@ class ShufersalDriver:
     async def _ua_sleep(self):
         await asyncio.sleep(config.UNATTENDED_POLL_SECONDS)
 
-    def _ua_fail(self, steps: List[str], code: str, message: str) -> APIException:
+    def _ua_fail(self, steps: List[str], code: str, message: str,
+                 details: Optional[Dict[str, Any]] = None) -> APIException:
         """Before the place-order click: a clean failure, no order was placed."""
         self._ua_log(steps, f"stopped before placing the order: {code}")
-        return APIException(status_code=409, code=code, message=message)
+        return APIException(status_code=409, code=code, message=message, details=details)
 
     @staticmethod
     def _on_checkout_page(path: str) -> bool:
@@ -1333,9 +1413,45 @@ class ShufersalDriver:
             raise self._ua_fail(steps, "reauth_failed", "The re-auth confirm button stayed disabled.")
         self._ua_log(steps, "re-auth: SMS code entered and confirmed")
 
+    async def _ua_missing_products(self, steps: List[str]) -> APIException:
+        """The missing-products popup is open: name the lines, click nothing.
+        The list comes from the checkout's own GET /checkout/recommendation/direct
+        (what the popup renders); the popup's markup is the fallback."""
+        items: List[Dict[str, Any]] = []
+        try:
+            status, _, text = await self._fetch(f"{BASE}/checkout/recommendation/direct")
+            if status == 200:
+                items = parse_checkout_recommendations(json.loads(text))
+        except (APIException, ParseError, ValueError):
+            items = []
+        popup = None
+        try:
+            popup = await self.page.evaluate(self.UA_MISSING_JS)
+        except Exception:
+            popup = None
+        if not items and popup:
+            items = [{"product_id": clean_code(i.get("code")), "name": i.get("name") or clean_code(i.get("code")),
+                      "reason": "out_of_stock", "qty": None, "line_id": None, "replaceable": None}
+                     for i in popup.get("items") or [] if clean_code(i.get("code"))]
+        named = ", ".join(f"{i['name']} ({i['product_id']})" for i in items) or "unreadable"
+        self._ua_log(steps, f"missing-products popup: {named}")
+        for i in items:  # the next GET /cart must not serve a cached "available"
+            self._stock_cache.pop(i["product_id"], None)
+        details = {"unavailable_items": items,
+                   "popup_options": (popup or {}).get("buttons") or [],
+                   "popup_text": (popup or {}).get("text")}
+        return self._ua_fail(
+            steps, "products_unavailable",
+            f"The site cannot supply {len(items) or 'some'} cart line(s) for this slot: {named}. "
+            "Nothing was clicked in its popup and no order was placed; remove or replace the line(s) "
+            "in the cart, then get a new quote.",
+            details=details)
+
     async def _ua_close_benefit_popup(self, steps: List[str], popups: List[str], dismissed: int):
         """Closes the credit-benefit popup by its exact X; any other popup stops
         the run before the place-order click."""
+        if "missingProducts" in popups:
+            raise await self._ua_missing_products(steps)
         others = [p for p in popups if p != "creditBenefitProductModal"]
         if others:
             raise self._ua_fail(steps, "checkout_blocked", f"An unexpected popup is open: {others}.")
@@ -1419,6 +1535,8 @@ class ShufersalDriver:
                     state = {}
                 if state.get("errorPopup"):
                     raise self._ua_fail(steps, "checkout_blocked", f"The checkout page shows an error: {state['errorPopup']}")
+                if "missingProducts" in (state.get("popups") or []):
+                    raise await self._ua_missing_products(steps)
                 if state.get("popups"):
                     raise self._ua_fail(steps, "checkout_blocked",
                                         f"An unexpected popup is open on the checkout page: {state['popups']}.")
@@ -1459,6 +1577,13 @@ class ShufersalDriver:
             state = await self._ua_state()
             if not self._on_checkout_page(state.get("path")) or not state.get("placeButton"):
                 raise self._ua_fail(steps, "checkout_blocked", "Left the checkout page while verifying it.")
+            # Popups the checkout app opened while it was being verified (the
+            # missing-products one renders after the page's own data loads).
+            if "missingProducts" in (state.get("popups") or []):
+                raise await self._ua_missing_products(steps)
+            if state.get("popups") or state.get("errorPopup"):
+                raise self._ua_fail(steps, "checkout_blocked",
+                                    f"A popup opened on the checkout page: {state.get('popups') or state.get('errorPopup')}.")
             if state.get("cvvSelector"):
                 cvv = config.SHUFERSAL_CVV or ""
                 if not re.fullmatch(r"\d{3,4}", cvv):

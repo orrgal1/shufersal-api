@@ -71,10 +71,12 @@ def log_mutation(
     sys.stdout.flush()
 
 class APIException(Exception):
-    def __init__(self, status_code: int, code: str, message: str):
+    def __init__(self, status_code: int, code: str, message: str, details: Optional[Dict[str, Any]] = None):
         self.status_code = status_code
         self.code = code
         self.message = message
+        # Server-generated structured data returned under error.details (never caller input).
+        self.details = details
         super().__init__(message)
 
 # Endpoints exempt from Bearer authentication for public inspection

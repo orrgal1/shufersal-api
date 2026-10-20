@@ -44,7 +44,7 @@ SAFE_CHECKOUT_CODES = {
     "live_checkout_disabled", "order_rejected", "checkout_not_configured", "browser_unavailable",
     "slot_select_failed", "checkout_unreachable", "quote_consumed", "cart_incomplete", "checkout_in_progress", "payment_method_unavailable", "invalid_input",
     "order_over_cap", "order_outcome_unresolved", "reauth_failed", "sms_unavailable", "sms_code_timeout",
-    "sms_code_ambiguous",
+    "sms_code_ambiguous", "products_unavailable",
 }
 
 logging.basicConfig(
@@ -80,10 +80,10 @@ async def api_exception_handler(request: Request, exc: APIException):
         # Only server-generated messages from known codes pass through.
         if exc.code not in SAFE_CHECKOUT_CODES:
             message = "Checkout could not be completed."
-    return JSONResponse(
-        status_code=exc.status_code,
-        content={"error": {"code": exc.code, "message": message}}
-    )
+    error = {"code": exc.code, "message": message}
+    if exc.details and (request.url.path != "/checkout/submit" or exc.code in SAFE_CHECKOUT_CODES):
+        error["details"] = exc.details
+    return JSONResponse(status_code=exc.status_code, content={"error": error})
 
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request: Request, exc: RequestValidationError):
@@ -302,6 +302,8 @@ async def create_checkout_quote(
         "slot": summary["slot"],
         "payment": summary["payment"],
         "prices_complete": summary["prices_complete"],
+        "unavailable_items": summary.get("unavailable_items") or [],
+        "availability_complete": summary.get("availability_complete", True),
         "total_is_estimate": True,
     })
     if idempotency_key:

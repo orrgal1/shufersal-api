@@ -118,6 +118,15 @@ class FakeSite:
         self.benefit_close_safe = True     # the benefit popup's X is the plain aria-label="סגור" button
         self.rotate_session_on_checkout_cart_read = False
         self.closed_with = []              # selectors the driver reported clicking to close popups
+        # ---- Stock (live 2026-10-20) ----
+        # Out-of-stock codes: left out of search results, product page class
+        # miglog-prod-outOfStock, listed by /checkout/recommendation/direct and
+        # shown in the checkout's #missingProducts popup.
+        self.out_of_stock = set()
+        self.product_page_status = 200
+        self.recommendation_status = None  # None: 200 on the checkout page, 400 elsewhere (live)
+        self.ui_clicks = []                # every selector the driver asked to click
+        self.missing_popup_late = False    # the popup opens only after the place-order button showed
 
     def expire_session(self):
         """The server forgets the session (idle timeout); takes effect on the next request."""
@@ -226,7 +235,8 @@ class FakeSite:
         self.requests.append((method, path, u.query, body))
         if path == "/online/he/search/results":
             term = q.get("q", [""])[0]
-            hits = [c for c, p in CATALOG.items() if term == c or term in p["name"] or term in c]
+            hits = [c for c, p in CATALOG.items() if (term == c or term in p["name"] or term in c)
+                    and c not in self.out_of_stock]
             results = [{"code": f"P_{c}", "name": CATALOG[c]["name"], "price": {"value": CATALOG[c]["price"]},
                         "sellingMethod": {"code": CATALOG[c]["selling"]}, "brandName": "x",
                         "stock": {"stockLevelStatus": {"code": "inStock"}}} for c in hits]
@@ -272,6 +282,8 @@ class FakeSite:
         if path == "/online/he/checkout/costSummary/direct":
             if self.checkout_gated and not self.checkout_reauthed:
                 return 200, BASE + "/A", "<!DOCTYPE html><html></html>"  # live: redirected home
+            if self.missing_popup_late and self.missing_lines() and "missingProducts" not in self.ui["checkout_popups"]:
+                self.ui["checkout_popups"].append("missingProducts")
             if self.cost_summary is not None:
                 return 200, url, json.dumps(self.cost_summary)
             subtotal = sum(CATALOG[e["code"]]["price"] * e["qty"] for e in self.cart)
@@ -284,10 +296,44 @@ class FakeSite:
         if path == "/online/he/checkout/timeSlot/getSelectedTimeSlot":
             code = self.checkout_selected_slot or self.selected_slot
             return 200, url, json.dumps({"code": code} if code else {})
+        if path.startswith("/online/he/p/P_"):
+            code = path.rsplit("P_", 1)[1]
+            if code not in CATALOG or self.product_page_status != 200:
+                return self.product_page_status if code in CATALOG else 404, url, "<html>not found</html>"
+            state = "outOfStock" if code in self.out_of_stock else "inStock"
+            return 200, url, (f'<div class="productDetails nonFood miglog-prod-{state} notOverlay"></div>'
+                              f'<div class="addToCart miglog-prod" data-product-code="P_{code}">'
+                              '<div class="miglog-prod-outOfStock-msg">חסר במלאי</div></div>')
+        if path == "/online/he/checkout/recommendation/direct":
+            if self.recommendation_status is not None:
+                return self.recommendation_status, url, '"אופס...|:|לא ניתן להשלים את הפעולה"'
+            if not self.checkout_reauthed:
+                return 400, url, '"אופס...|:|לא ניתן להשלים את הפעולה"'
+            return 200, url, json.dumps(self.recommendations())
         if path == "/online/he/my-account":
             return 200, BASE + "/online/he/my-account/personal-area", "<html></html>"
         return 404, url, "not found"
 
+
+    def missing_lines(self):
+        return [e for e in self.cart if e["code"] in self.out_of_stock]
+
+    def recommendations(self):
+        lines = self.missing_lines()
+        if not lines:
+            return []
+        return [{"type": "OUT_OF_STOCK", "count": len(lines), "products": [
+            {"product": {"code": f"P_{e['code']}", "name": CATALOG[e["code"]]["name"],
+                         "stock": {"stockLevelStatus": {"code": "outOfStock"}},
+                         "cartStatus": {"inCart": True, "qty": e["qty"], "cartEntryNumber": e["entry"]}},
+             "replaceable": True} for e in lines]}]
+
+    def missing_popup(self):
+        if "missingProducts" not in self.ui["checkout_popups"]:
+            return None
+        return {"items": [{"code": f"P_{e['code']}", "name": CATALOG[e["code"]]["name"]} for e in self.missing_lines()],
+                "buttons": ["להחלפה", "לא תודה", "המשך לתשלום"],
+                "text": "חלק מהפריטים שהזמנת לכתובת זו חסרים במלאי."}
 
     # ---- unattended UI ----
     def ui_state(self, page):
@@ -314,6 +360,7 @@ class FakeSite:
 
     def ui_click(self, page, sel):
         ui = self.ui
+        self.ui_clicks.append(sel)
         path = urlparse(page._url).path
         if sel == ".miglog-cart-summary-checkoutLink" and path.endswith("/cart/cartsummary"):
             ui.update(modal=None, sms_tab=False, sms_sent=False, sms_value="", otp_error=False, three_ds=False,
@@ -340,6 +387,8 @@ class FakeSite:
                 self.checkout_reauthed = True
                 page._url = BASE + "/online/he/miglog-checkout"
                 ui["checkout_popups"] = list(self.checkout_popups)
+                if self.missing_lines() and not self.missing_popup_late:
+                    ui["checkout_popups"].append("missingProducts")
                 if self.cart_change_on_checkout:
                     self.cart.append({"entry": len(self.cart), "code": "4131074", "qty": 1.0})
             else:
@@ -509,6 +558,8 @@ class FakePage:
             return self.site.ui_click(self, args)
         if "/*ua-fill*/" in script:
             return self.site.ui_fill(self, args[0], args[1])
+        if "/*ua-missing*/" in script:
+            return self.site.missing_popup()
         if "/*ua-close-benefit*/" in script:
             return self.site.ui_close_benefit(self)
         if args is None and "miglog-cart-summary-totalprice" in script:
