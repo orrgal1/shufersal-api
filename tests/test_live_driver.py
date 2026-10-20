@@ -725,12 +725,17 @@ def test_guest_cart_summary_page_blocks(live, client, site, watch_fast, monkeypa
     assert any("logged-in" in b for b in body["blockers"])
 
 
-def test_checkout_total_wins_over_cart_summary_when_checkout_opens(live, client, site):
+def test_cart_summary_total_wins_over_checkout_cost_summary(live, client, site):
+    """Live 2026-10-20: with an earlier re-auth still valid, /checkout opened and its
+    costSummary omitted the slot fee (403.71 vs 439.62). The cart summary total,
+    which includes the fee, is the preflight source; costSummary is the fallback."""
     _fill(site)
     q = _quote(client)
-    site.summary_total_text = "1.00 ₪"  # would drift; the checkout cost summary is authoritative
     body = client.post("/checkout/submit", json=_dry(q), headers=AUTH).json()
-    assert body["site_total_ils"] == q["total_ils"] and body["checks"]["site_total_source"] == "checkout"
+    assert body["site_total_ils"] == q["total_ils"] and body["checks"]["site_total_source"] == "cart_summary"
+    site.summary_total_text = "1.00 ₪"
+    res = client.post("/checkout/submit", json=_dry(_quote(client)), headers=AUTH)
+    assert res.status_code == 409 and res.json()["error"]["code"] == "total_drift"
 
 
 @pytest.mark.parametrize("text,expected", [

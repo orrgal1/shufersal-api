@@ -1170,8 +1170,14 @@ class ShufersalDriver:
 
         # 4. The site's own total for the order: the checkout page's cost summary
         #    when the checkout page opened, else the cart summary page's total.
-        site_total, total_source = None, None
-        if reached:
+        # The cart summary prints the order total INCLUDING the chosen slot's
+        # delivery fee, which is what the quote confirms. The checkout page's
+        # costSummary can omit the fee at this point (seen live 2026-10-20 when an
+        # earlier SMS re-auth was still valid: 403.71 vs 439.62), so it is only a
+        # fallback here; the unattended path re-verifies the checkout page's own
+        # total right before the place-order click.
+        site_total, total_source = (summary_total, "cart_summary") if summary_total is not None else (None, None)
+        if site_total is None and reached:
             try:
                 status, _, text = await self._fetch(f"{BASE}/checkout/costSummary/direct")
                 if status == 200:
@@ -1179,8 +1185,6 @@ class ShufersalDriver:
                     total_source = "checkout" if site_total is not None else None
             except (APIException, ValueError):
                 site_total = None
-        if site_total is None and summary_total is not None:
-            site_total, total_source = summary_total, "cart_summary"
         if site_total is None:
             # Blocks watched runs too: the total must be checked by the service, not only by eye.
             blockers.append("could not read the order total from the cart summary or checkout page")
