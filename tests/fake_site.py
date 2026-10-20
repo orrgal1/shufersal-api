@@ -12,6 +12,8 @@ from html import escape
 from urllib.parse import parse_qs, urlparse
 
 BASE = "https://www.shufersal.co.il"
+# How UA_STATE_JS names the card notice (it has no id; live 2026-10-20).
+CREDIT_NOTICE = "modal messageCreditCardModal messagesModal centerModal in"
 
 CATALOG = {
     "522319": {"name": "חלב טרי 3%", "price": 7.35, "selling": "BY_UNIT"},
@@ -127,6 +129,14 @@ class FakeSite:
         self.recommendation_status = None  # None: 200 on the checkout page, 400 elsewhere (live)
         self.ui_clicks = []                # every selector the driver asked to click
         self.missing_popup_late = False    # the popup opens only after the place-order button showed
+        # The informational card notice (live 2026-10-20): "ok" = the plain
+        # notice with one "הבנתי" button; "extra_button" / "other_text" /
+        # "two_buttons" = variants that must not be clicked.
+        self.credit_notice = None
+        self.credit_notice_late = False    # opens during the checkout-page verification
+        self.credit_notice_total_delta = 0.0  # the checkout total changes when it is dismissed
+        self.credit_notice_clicks = 0
+        self.events = []                   # ordered log: cost_summary, credit_notice_dismissed, place_click
 
     def expire_session(self):
         """The server forgets the session (idle timeout); takes effect on the next request."""
@@ -282,6 +292,11 @@ class FakeSite:
         if path == "/online/he/checkout/costSummary/direct":
             if self.checkout_gated and not self.checkout_reauthed:
                 return 200, BASE + "/A", "<!DOCTYPE html><html></html>"  # live: redirected home
+            if self.checkout_reauthed:
+                self.events.append("cost_summary")
+            if (self.credit_notice and self.credit_notice_late and self.credit_notice_clicks == 0
+                    and CREDIT_NOTICE not in self.ui["checkout_popups"]):
+                self.ui["checkout_popups"].append(CREDIT_NOTICE)
             if self.missing_popup_late and self.missing_lines() and "missingProducts" not in self.ui["checkout_popups"]:
                 self.ui["checkout_popups"].append("missingProducts")
             if self.cost_summary is not None:
@@ -314,6 +329,21 @@ class FakeSite:
             return 200, BASE + "/online/he/my-account/personal-area", "<html></html>"
         return 404, url, "not found"
 
+
+    def credit_notice_eval(self, click):
+        if CREDIT_NOTICE not in self.ui["checkout_popups"]:
+            return {"ok": False, "why": "modals:0"}
+        variant = self.credit_notice
+        if variant in ("extra_button", "two_buttons"):
+            return {"ok": False, "why": "controls:2"}
+        if variant == "other_text":
+            return {"ok": False, "why": "text"}
+        if click:
+            self.credit_notice_clicks += 1
+            self.ui["checkout_popups"].remove(CREDIT_NOTICE)
+            self.checkout_total_delta += self.credit_notice_total_delta
+            self.events.append("credit_notice_dismissed")
+        return {"ok": True}
 
     def missing_lines(self):
         return [e for e in self.cart if e["code"] in self.out_of_stock]
@@ -389,6 +419,8 @@ class FakeSite:
                 ui["checkout_popups"] = list(self.checkout_popups)
                 if self.missing_lines() and not self.missing_popup_late:
                     ui["checkout_popups"].append("missingProducts")
+                if self.credit_notice and not self.credit_notice_late:
+                    ui["checkout_popups"].append(CREDIT_NOTICE)
                 if self.cart_change_on_checkout:
                     self.cart.append({"entry": len(self.cart), "code": "4131074", "qty": 1.0})
             else:
@@ -396,6 +428,7 @@ class FakeSite:
             return True
         if sel == "a.btnConfirm" and path.endswith("/miglog-checkout") and not ui["checkout_popups"]:
             self.place_clicks += 1
+            self.events.append("place_click")
             if self.after_click == "confirm":
                 self.orders_placed += 1
                 page._url = self.confirmation_url
@@ -558,6 +591,8 @@ class FakePage:
             return self.site.ui_click(self, args)
         if "/*ua-fill*/" in script:
             return self.site.ui_fill(self, args[0], args[1])
+        if "/*ua-credit-notice*/" in script:
+            return self.site.credit_notice_eval(bool(args))
         if "/*ua-missing*/" in script:
             return self.site.missing_popup()
         if "/*ua-close-benefit*/" in script:
