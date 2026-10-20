@@ -102,6 +102,12 @@ class FakeSite:
         self.login_sms_text = "קוד האימות שלך לשופרסל הוא: {code}"
         self.send_login_sms = True
         self.stale_login_sms = False       # also deliver an older code from before the trigger
+        self.login_sms_codes = []          # codes the next sends deliver (then login_code); the site
+                                           # accepts only login_code (others: rejected / expired)
+        self.resend_link = True            # the OTP form has .resend-otp-link.passwordModal
+        self.resend_sends_sms = True
+        self.login_codes_sent = []
+        self.login_codes_submitted = []    # every code the driver confirmed in the re-auth modal
         self.ui = {"modal": None, "sms_tab": False, "sms_sent": False, "sms_value": "", "otp_error": False,
                    "three_ds": False, "error_popup": None, "cvv_value": None, "checkout_popups": []}
         self.checkout_popups = []          # popups the checkout page opens on load (closed by their X)
@@ -423,14 +429,24 @@ class FakeSite:
         if sel == '#forgottenPwdModal a.tab[href="#smsTab"]' and ui["modal"] == "pwd":
             ui["sms_tab"] = True
             return True
-        if sel == "#sendSmsBtn" and ui["modal"] == "pwd" and ui["sms_tab"]:
+        if sel == '#forgottenPwdModal a.tab[href="#passwordTab"]' and ui["modal"] == "pwd":
+            ui.update(sms_tab=False, sms_sent=False, sms_value="", otp_error=False)  # the SMS pane is hidden
+            return True
+        if sel == "#sendSmsBtn" and ui["modal"] == "pwd" and ui["sms_tab"] and not ui["sms_sent"]:
             ui["sms_sent"] = True
             if self.send_login_sms:
-                self.sms.add(self.login_sms_sender, self.login_sms_text.format(code=self.login_code))
+                self._send_login_sms()
+            return True
+        if (sel == "#forgottenPwdModal .resend-otp-link.passwordModal" and ui["modal"] == "pwd"
+                and ui["sms_sent"] and self.resend_link):
+            ui.update(sms_value="", otp_error=False)  # #sms-step2 is replaced by the new form
+            if self.resend_sends_sms:
+                self._send_login_sms()
             return True
         if sel == "#forgottenPwdModal .js-otp-submit-passwordModal" and ui["modal"] == "pwd":
             if len(ui["sms_value"]) != 6:
                 return False  # disabled
+            self.login_codes_submitted.append(ui["sms_value"])
             if ui["sms_value"] == self.login_code:
                 ui["modal"] = None
                 self.checkout_reauthed = True
@@ -525,6 +541,11 @@ class FakeSite:
         ui = self.ui
         return {"toasts": list(ui.get("toasts", [])), "alerts": list(ui.get("alerts", [])), "modals": [],
                 "iframes": [], "spinner": bool(ui.get("spinner")), "threeDS": bool(ui["three_ds"])}
+
+    def _send_login_sms(self):
+        code = self.login_sms_codes.pop(0) if self.login_sms_codes else self.login_code
+        self.login_codes_sent.append(code)
+        self.sms.add(self.login_sms_sender, self.login_sms_text.format(code=code))
 
     def ui_fill(self, page, sel, value):
         if sel == "#smsCodeInput" and self.ui["modal"] == "pwd":

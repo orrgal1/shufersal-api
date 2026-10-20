@@ -300,11 +300,73 @@ def test_code_received_before_trigger_is_ignored_even_if_recent(ua, client, site
 
 
 def test_wrong_login_code_is_a_clean_failure(ua, client, site):
+    # Every SMS carries the same wrong code: the resent one is not typed again.
     site.login_sms_text = "קוד: 000000"
     q = _quote(client)
     res = _submit(client, q, "ua-11")
     assert res.status_code == 409 and res.json()["error"]["code"] == "reauth_failed"
+    assert "same code" in res.json()["error"]["message"]
+    assert site.login_codes_submitted == ["000000"]
     assert site.place_clicks == 0
+
+
+RESEND = "#forgottenPwdModal .resend-otp-link.passwordModal"
+
+
+def test_expired_first_code_gets_one_new_code_then_succeeds(ua, client, site, caplog):
+    # Or, 2026-10-20: the first code was "expired"; a new one worked. No 3-D
+    # Secure for the saved card: the click goes straight to the confirmation page.
+    caplog.set_level(logging.INFO)
+    site.login_sms_codes = ["135790"]  # the site rejects it; the resend delivers login_code
+    q = _quote(client)
+    res = _submit(client, q, "ua-resend-ok")
+    assert res.status_code == 200 and res.json()["status"] == "placed", res.text
+    assert site.login_codes_submitted == ["135790", site.login_code]
+    assert site.ui_clicks.count(RESEND) == 1 and site.ui_clicks.count("#sendSmsBtn") == 1
+    assert site.place_clicks == 1 and site.three_ds_codes == []
+    steps = res.json()["checks"]["unattended_steps"]
+    for expected in ("the site rejected the SMS code", "fresh SMS baseline taken before the resend",
+                     "clicked the modal's resend control", "new SMS code requested",
+                     "new SMS code entered and confirmed", "reached the checkout page"):
+        assert any(expected in s for s in steps), (expected, steps)
+    _no_secrets(caplog, res, site)
+    assert "135790" not in caplog.text + res.text
+
+
+def test_two_rejected_codes_fail_after_a_single_resend(ua, client, site):
+    site.login_sms_codes = ["111111", "222222"]
+    q = _quote(client)
+    res = _submit(client, q, "ua-resend-fail")
+    assert res.status_code == 409 and res.json()["error"]["code"] == "reauth_failed", res.text
+    assert "rejected too" in res.json()["error"]["message"]
+    assert site.login_codes_submitted == ["111111", "222222"]
+    assert site.login_codes_sent == ["111111", "222222"]
+    assert site.ui_clicks.count(RESEND) == 1
+    assert site.place_clicks == 0
+    assert main.checkout_ledger.unresolved() == []
+
+
+def test_old_code_is_never_reentered_when_no_new_sms_arrives(ua, client, site):
+    # The rejected code's SMS is still fresh in the inbox, but it is at or below
+    # the baseline taken before the resend.
+    site.login_sms_codes = ["135790"]
+    site.resend_sends_sms = False
+    q = _quote(client)
+    res = _submit(client, q, "ua-resend-none")
+    assert res.status_code == 409 and res.json()["error"]["code"] == "sms_code_timeout", res.text
+    assert site.login_codes_submitted == ["135790"]
+    assert site.ui_clicks.count(RESEND) == 1 and site.place_clicks == 0
+
+
+def test_resend_falls_back_to_rechoosing_sms(ua, client, site):
+    site.login_sms_codes = ["135790"]
+    site.resend_link = False
+    q = _quote(client)
+    res = _submit(client, q, "ua-resend-tab")
+    assert res.status_code == 200 and res.json()["status"] == "placed", res.text
+    assert site.login_codes_submitted == ["135790", site.login_code]
+    assert '#forgottenPwdModal a.tab[href="#passwordTab"]' in site.ui_clicks
+    assert site.ui_clicks.count("#sendSmsBtn") == 2
 
 
 @pytest.mark.parametrize("field,value", [("issuer_sender", "Cal"), ("issuer_amount", 1.0),

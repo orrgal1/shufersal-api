@@ -1553,33 +1553,89 @@ class ShufersalDriver:
         p = (path or "").rstrip("/")
         return p.endswith("/miglog-checkout") or p.endswith("/checkout") or "/checkout/multi" in p
 
-    async def _ua_sms_reauth(self, steps: List[str]):
-        """The re-auth modal: choose SMS, send the code, read it via sms-api, enter it."""
+    # Re-sending the re-auth code (main bundle mainm8e8d1.js, read 2026-10-20):
+    #   $(document).on("click", ".resend-otp-link.passwordModal", ...) clears
+    #   .js-otpCode and calls ACC.loadHtmlOtpIntoPasswordModal() -> POST
+    #   /otp/send/jsp (a new SMS), whose answer REPLACES #sms-step2 (fresh
+    #   #smsCodeInput, the .otpError hidden again). The handler is delegated, so
+    #   clicking the .resend-otp-link.passwordModal element itself runs only it.
+    #   The password-modal OTP form is fetched by that POST (it sends an SMS),
+    #   so its markup was not opened live; the fallback is re-choosing SMS:
+    #   the "shown.bs.tab" handler for #smsTab shows #sms-step1 again and
+    #   #sendSmsBtn sends a new code the same way as the first time.
+    UA_RESEND_SELECTOR = "#forgottenPwdModal .resend-otp-link.passwordModal"
+
+    async def _ua_sms_baseline(self, steps: List[str]) -> Dict[str, Any]:
         from sms_codes import SmsCodeError
-        await self.page.evaluate(self.UA_CLICK_JS, '#forgottenPwdModal a.tab[href="#smsTab"]')
-        await self._ua_sleep()
         try:
-            base = await self.sms_reader.baseline()
+            return await self.sms_reader.baseline()
         except SmsCodeError as e:
             raise self._ua_fail(steps, e.code, str(e))
-        if not await self.page.evaluate(self.UA_CLICK_JS, "#sendSmsBtn"):
-            raise self._ua_fail(steps, "reauth_failed", "The SMS option of the re-auth window could not be chosen.")
-        self._ua_log(steps, "re-auth: SMS code requested")
+
+    async def _ua_sms_enter(self, steps: List[str], base: Dict[str, Any], what: str,
+                            reject_digest: Optional[str] = None) -> str:
+        """Waits for the code field, reads a code newer than `base`, types it and
+        confirms. Returns a digest of the code (never the code) so a resend can
+        refuse to type the rejected code again."""
+        import hashlib
+        from sms_codes import SmsCodeError
         deadline = time.monotonic() + config.UNATTENDED_STEP_SECONDS
-        while not (await self._ua_state()).get("smsInput"):
+        while True:
+            state = await self._ua_state()
+            if state.get("smsInput") and not state.get("otpError"):
+                break
             if time.monotonic() > deadline:
-                raise self._ua_fail(steps, "reauth_failed", "The SMS code field did not appear.")
+                raise self._ua_fail(steps, "reauth_failed", f"The SMS code field did not appear ({what}).")
             await self._ua_sleep()
         try:
             code = await self.sms_reader.wait_for_code("login", base)
         except SmsCodeError as e:
             raise self._ua_fail(steps, e.code, str(e))
+        digest = hashlib.sha256(code.encode()).hexdigest()
+        if reject_digest and digest == reject_digest:
+            code = None
+            raise self._ua_fail(steps, "reauth_failed",
+                                "The site rejected the SMS code, and the resent SMS carried the same code; "
+                                "it was not entered again.")
+        self._ua_log(steps, f"re-auth: {what} received from sms-api")
         await self.page.evaluate(self.UA_FILL_JS, ["#smsCodeInput", code])
         code = None
         await self._ua_sleep()
         if not await self.page.evaluate(self.UA_CLICK_JS, "#forgottenPwdModal .js-otp-submit-passwordModal"):
             raise self._ua_fail(steps, "reauth_failed", "The re-auth confirm button stayed disabled.")
-        self._ua_log(steps, "re-auth: SMS code entered and confirmed")
+        self._ua_log(steps, f"re-auth: {what} entered and confirmed")
+        return digest
+
+    async def _ua_sms_reauth(self, steps: List[str]) -> str:
+        """The re-auth modal: choose SMS, send the code, read it via sms-api, enter it."""
+        await self.page.evaluate(self.UA_CLICK_JS, '#forgottenPwdModal a.tab[href="#smsTab"]')
+        await self._ua_sleep()
+        base = await self._ua_sms_baseline(steps)
+        if not await self.page.evaluate(self.UA_CLICK_JS, "#sendSmsBtn"):
+            raise self._ua_fail(steps, "reauth_failed", "The SMS option of the re-auth window could not be chosen.")
+        self._ua_log(steps, "re-auth: SMS code requested")
+        return await self._ua_sms_enter(steps, base, "SMS code")
+
+    async def _ua_sms_resend(self, steps: List[str], site_error: str, rejected_digest: Optional[str]) -> str:
+        """Once per checkout: the site rejected (e.g. expired) the code. Take a
+        fresh sms baseline, ask the modal for a new code, enter the new one."""
+        self._ua_log(steps, f"re-auth: the site rejected the SMS code (\"{(site_error or '')[:80]}\"); "
+                            "requesting a new code once")
+        base = await self._ua_sms_baseline(steps)  # the rejected code's SMS is at or below this row
+        self._ua_log(steps, "re-auth: fresh SMS baseline taken before the resend")
+        if await self.page.evaluate(self.UA_CLICK_JS, self.UA_RESEND_SELECTOR):
+            self._ua_log(steps, "re-auth: clicked the modal's resend control (.resend-otp-link.passwordModal)")
+        else:
+            await self.page.evaluate(self.UA_CLICK_JS, '#forgottenPwdModal a.tab[href="#passwordTab"]')
+            await self._ua_sleep()
+            await self.page.evaluate(self.UA_CLICK_JS, '#forgottenPwdModal a.tab[href="#smsTab"]')
+            await self._ua_sleep()
+            if not await self.page.evaluate(self.UA_CLICK_JS, "#sendSmsBtn"):
+                raise self._ua_fail(steps, "reauth_failed",
+                                    "The site rejected the SMS code, and no way to request a new code was found.")
+            self._ua_log(steps, "re-auth: no resend control; re-chose SMS and pressed send again")
+        self._ua_log(steps, "re-auth: new SMS code requested")
+        return await self._ua_sms_enter(steps, base, "new SMS code", reject_digest=rejected_digest)
 
     async def _ua_missing_products(self, steps: List[str]) -> APIException:
         """The missing-products popup is open: name the lines, click nothing.
@@ -1669,7 +1725,7 @@ class ShufersalDriver:
         if not await self.page.evaluate(self.UA_CLICK_JS, ".miglog-cart-summary-checkoutLink"):
             raise self._ua_fail(steps, "checkout_unreachable", "The 'מעבר לקופה' button could not be clicked.")
         self._ua_log(steps, "clicked 'מעבר לקופה'")
-        reauthed, dismissed = False, 0
+        reauthed, resent, dismissed, digest = False, False, 0, None
         deadline = time.monotonic() + config.UNATTENDED_STEP_SECONDS + config.SMS_WAIT_SECONDS
         while time.monotonic() < deadline:
             await self._ua_sleep()
@@ -1683,12 +1739,22 @@ class ShufersalDriver:
             if state.get("strongAuth"):
                 raise self._ua_fail(steps, "reauth_failed", "The site asks for strong authentication; not automated.")
             if state.get("otpError"):
-                raise self._ua_fail(steps, "reauth_failed", "The site rejected the SMS code.")
+                if not reauthed or resent:
+                    raise self._ua_fail(steps, "reauth_failed", "The site rejected the SMS code."
+                                        + (" A new code was requested once and was rejected too." if resent else ""))
+                # Rejected or expired (seen live 2026-10-20: the first code was
+                # "expired", a resent one worked): one new code, never the old one.
+                resent = True
+                await self._ua_sms_resend(steps, state["otpError"], digest)
+                digest = None
+                deadline = max(deadline, time.monotonic() + config.UNATTENDED_STEP_SECONDS)
+                continue
             if state.get("pwdModal"):
                 if reauthed:
                     continue  # waiting for the site to navigate after the code
-                await self._ua_sms_reauth(steps)
+                digest = await self._ua_sms_reauth(steps)
                 reauthed = True
+                deadline = max(deadline, time.monotonic() + config.UNATTENDED_STEP_SECONDS)
                 continue
             if state.get("popups"):
                 await self._ua_close_benefit_popup(steps, state["popups"], dismissed)
