@@ -6,7 +6,7 @@ import logging
 from pathlib import Path
 from datetime import datetime, timezone
 from contextlib import asynccontextmanager
-from typing import Optional
+from typing import Any, Dict, Optional
 
 from fastapi import FastAPI, Depends, Header, Request, status
 from fastapi.responses import JSONResponse
@@ -44,8 +44,23 @@ SAFE_CHECKOUT_CODES = {
     "live_checkout_disabled", "order_rejected", "checkout_not_configured", "browser_unavailable",
     "slot_select_failed", "checkout_unreachable", "quote_consumed", "cart_incomplete", "checkout_in_progress", "payment_method_unavailable", "invalid_input",
     "order_over_cap", "order_outcome_unresolved", "reauth_failed", "sms_unavailable", "sms_code_timeout",
-    "sms_code_ambiguous", "products_unavailable",
+    "sms_code_ambiguous", "products_unavailable", "attempt_interrupted",
 }
+# Idempotency-Keys whose order attempt is running in THIS process right now. A
+# same-key request (e.g. a gateway retry on a slow answer) gets 202 in_progress.
+ACTIVE_SUBMIT_KEYS: set = set()
+IN_PROGRESS_POLL_SECONDS = 30
+
+
+def _error_body(exc: "APIException", path: str = "/checkout/submit") -> Dict[str, Any]:
+    """The error body the API returns for exc (the same filtering as the handler)."""
+    message = exc.message
+    if path == "/checkout/submit" and exc.code not in SAFE_CHECKOUT_CODES:
+        message = "Checkout could not be completed."
+    error = {"code": exc.code, "message": message}
+    if exc.details and (path != "/checkout/submit" or exc.code in SAFE_CHECKOUT_CODES):
+        error["details"] = exc.details
+    return {"error": error}
 
 logging.basicConfig(
     level=logging.INFO,
@@ -74,16 +89,9 @@ app = FastAPI(
 
 @app.exception_handler(APIException)
 async def api_exception_handler(request: Request, exc: APIException):
-    message = exc.message
-    if request.url.path == "/checkout/submit":
-        # Driver errors must not be able to reflect a caller's payment secret.
-        # Only server-generated messages from known codes pass through.
-        if exc.code not in SAFE_CHECKOUT_CODES:
-            message = "Checkout could not be completed."
-    error = {"code": exc.code, "message": message}
-    if exc.details and (request.url.path != "/checkout/submit" or exc.code in SAFE_CHECKOUT_CODES):
-        error["details"] = exc.details
-    return JSONResponse(status_code=exc.status_code, content={"error": error})
+    # On /checkout/submit, driver errors must not be able to reflect a caller's
+    # payment secret: only server-generated messages from known codes pass through.
+    return JSONResponse(status_code=exc.status_code, content=_error_body(exc, request.url.path))
 
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request: Request, exc: RequestValidationError):
@@ -392,12 +400,54 @@ async def submit_checkout(
             raise APIException(status_code=409, code="idempotency_key_used",
                                message="This Idempotency-Key was already used for another quote. Use a new key.")
         if previous is not None:
-            if previous["state"] in FINAL_SUBMIT_STATES and previous["result"]:
-                log_mutation("POST", "/checkout/submit", previous["http_status"], None, {"replayed": True})
-                return JSONResponse(status_code=previous["http_status"], content=previous["result"])
-            raise APIException(status_code=409, code="idempotency_key_used",
-                               message=f"This Idempotency-Key was already used (state: {previous['state']}). Use a new key.")
+            return _replay_submit(idempotency_key, previous)
 
+    if place_order:
+        ACTIVE_SUBMIT_KEYS.add(idempotency_key)
+    try:
+        return await _run_submit(payload, quote, expected_hash, place_order, unattended, idempotency_key)
+    finally:
+        if place_order:
+            ACTIVE_SUBMIT_KEYS.discard(idempotency_key)
+
+
+def _replay_submit(key: str, previous: Dict[str, Any]) -> JSONResponse:
+    """A request with an Idempotency-Key that already has an attempt: never runs
+    the checkout again; answers with that attempt's stored outcome."""
+    state, result = previous["state"], previous.get("result")
+    if state in ("in_progress", "placing") and key in ACTIVE_SUBMIT_KEYS:
+        # The first request with this key is still running (e.g. this is a
+        # gateway retry of a slow request). Not a failure and not a reason for a new key.
+        log_mutation("POST", "/checkout/submit", 202, None, {"in_progress": True})
+        return JSONResponse(
+            status_code=202, headers={"Retry-After": str(IN_PROGRESS_POLL_SECONDS)},
+            content={"status": "in_progress", "idempotency_key_state": state,
+                     "message": "An order attempt with this Idempotency-Key is still running. Do NOT retry with a "
+                                f"new key; send this same request with the same key again in about "
+                                f"{IN_PROGRESS_POLL_SECONDS} s to get its result.",
+                     "retry_after_seconds": IN_PROGRESS_POLL_SECONDS})
+    if result:
+        log_mutation("POST", "/checkout/submit", previous["http_status"], None, {"replayed": True})
+        return JSONResponse(status_code=previous["http_status"] or 409, content=result,
+                            headers={"Idempotent-Replayed": "true"})
+    if state.startswith("failed:"):
+        # Recorded before failures stored their error body: replay the code.
+        code = state.split(":", 1)[1]
+        return JSONResponse(status_code=previous["http_status"] or 409, headers={"Idempotent-Replayed": "true"},
+                            content={"error": {"code": code, "message": f"The earlier attempt with this "
+                                               f"Idempotency-Key failed ({code}); its message was not recorded."}})
+    if state == "in_progress":
+        # Claimed by a process that is gone, before any place-order click.
+        raise APIException(status_code=409, code="attempt_interrupted",
+                           message="The earlier attempt with this Idempotency-Key was interrupted (service restart) "
+                                   "before the place-order click. Get a new quote and use a new key.")
+    raise APIException(status_code=409, code="order_outcome_unresolved",
+                       message=f"The earlier attempt with this Idempotency-Key has an unknown outcome ({state}); "
+                               "no further orders until Or checks the site and runs "
+                               "`checkout_ledger.py resolve <key> placed|not_placed`.")
+
+
+async def _run_submit(payload, quote, expected_hash, place_order, unattended, idempotency_key):
     try:
         result = await shufersal_driver.checkout(
             slot_id=quote["delivery_slot_id"],
@@ -410,11 +460,13 @@ async def submit_checkout(
         )
     except APIException as exc:
         if place_order:
-            checkout_ledger.finish(idempotency_key, f"failed:{exc.code}", exc.status_code, {})
+            checkout_ledger.finish(idempotency_key, f"failed:{exc.code}", exc.status_code, _error_body(exc))
         raise
     except Exception:
         if place_order:
-            checkout_ledger.finish(idempotency_key, "outcome_unknown", 502, {})
+            checkout_ledger.finish(idempotency_key, "outcome_unknown", 502, {"error": {
+                "code": "upstream_error", "message": "The upstream service failed.",
+                "details": {"ledger_state": "outcome_unknown"}}})
         raise
 
     response = CheckoutSubmitResponse(

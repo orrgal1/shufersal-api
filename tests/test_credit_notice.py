@@ -86,6 +86,19 @@ LIVE_TEXT = ('<div class="modal-body"><h3>לתשומת ליבך,</h3><p>כרטי
 OK_BUTTON = '<button type="button" class="btn" onclick="window.__clicked=(window.__clicked||0)+1"><span>הבנתי</span></button>'
 
 
+X_BTN = '<button data-v-b892352c="" type="button" aria-label="סגור" class="btnClose"></button>'
+LIVE_20261020 = (
+    '<html><body><div data-v-b892352c="" data-v-f54db400="" tabindex="-1" class="modal messageCreditCardModal '
+    'messagesModal centerModal in" style="z-index: 1040; display: block;"><div data-v-b892352c="" class="modal-dialog">'
+    + X_BTN + ' <div data-v-b892352c="" class="messagesContainer"><span data-v-b892352c="" class="title">לתשומת ליבך,'
+    '</span> <div data-v-b892352c="" class="subTitle"><strong data-v-b892352c="">כרטיס אשראי שופרסל שלך לא מסומן'
+    '</strong></div> <div data-v-b892352c="">המבצעים למחזיקי כרטיס אשראי שופרסל - לא יכובדו</div> '
+    '<div data-v-b892352c="">בכדי לממש את המבצעים יש להחליף לתשלום באשראי שופרסל</div> '
+    '<div data-v-b892352c="" class="btnContainer"><button data-v-b892352c="" type="button" class="btn radius" '
+    'onclick="window.__clicked=(window.__clicked||0)+1">\n          הבנתי\n          '
+    '<span data-v-b892352c="" class="sr-only">הבנתי</span></button></div></div></div></div></body></html>')
+
+
 def _modal(inner, extra_modal=""):
     return ('<html><body><div class="modal messageCreditCardModal messagesModal centerModal in" '
             f'style="display:block">{inner}</div>{extra_modal}</body></html>')
@@ -94,7 +107,21 @@ def _modal(inner, extra_modal=""):
 CASES = {
     "ok": (_modal(LIVE_TEXT + OK_BUTTON), True),
     "extra_button": (_modal(LIVE_TEXT + OK_BUTTON + '<button type="button">להחלפה לאשראי שופרסל</button>'), False),
-    "close_x": (_modal('<button class="btnClose" aria-label="סגור"></button>' + LIVE_TEXT + OK_BUTTON), False),
+    "close_x": (_modal('<button type="button" class="btnClose" aria-label="סגור"></button>' + LIVE_TEXT + OK_BUTTON), True),
+    # The exact live markup of 2026-10-20 08:36 (blocked that morning's run as "controls:2").
+    "live_20261020": (LIVE_20261020, True),
+    "live_two_x": (LIVE_20261020.replace('<div data-v-b892352c="" class="messagesContainer">', X_BTN
+                                         + '<div data-v-b892352c="" class="messagesContainer">'), False),
+    "live_x_with_text": (LIVE_20261020.replace('class="btnClose"></button>', 'class="btnClose">לתשלום</button>'), False),
+    "live_x_other_aria": (LIVE_20261020.replace('aria-label="סגור" class="btnClose"', 'aria-label="החלף" class="btnClose"'), False),
+    "live_x_submit": (LIVE_20261020.replace('<button data-v-b892352c="" type="button" aria-label="סגור"',
+                                            '<button data-v-b892352c="" type="submit" aria-label="סגור"'), False),
+    "live_x_link": (LIVE_20261020.replace(X_BTN, '<a href="/change-card" aria-label="סגור" class="btnClose"></a>'), False),
+    "live_sr_other": (LIVE_20261020.replace('<span data-v-b892352c="" class="sr-only">הבנתי</span>',
+                                            '<span data-v-b892352c="" class="sr-only">אישור</span>'), False),
+    "live_extra_button": (LIVE_20261020.replace('</button></div></div>',
+                                                '</button><button type="button" class="btn">החלפה לאשראי שופרסל</button></div></div>'), False),
+    "live_other_text": (LIVE_20261020.replace('לא יכובדו</div>', 'לא יכובדו</div><div>יש לאשר חיוב נוסף</div>'), False),
     "two_ok_buttons": (_modal(LIVE_TEXT + OK_BUTTON + OK_BUTTON), False),
     "link": (_modal(LIVE_TEXT + LIVE_TEXT.replace("<h3>", '<a href="/change-card">שינוי</a><h3>') + OK_BUTTON), False),
     "other_text": (_modal(LIVE_TEXT + "<p>יש לאשר את החלפת אמצעי התשלום</p>" + OK_BUTTON), False),

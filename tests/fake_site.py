@@ -595,6 +595,8 @@ class FakePage:
             return self.site.credit_notice_eval(bool(args))
         if "/*ua-missing*/" in script:
             return self.site.missing_popup()
+        if "/*ua-popup-text*/" in script:
+            return [{"popup": p, "text": f"text of {p}"} for p in self.site.ui["checkout_popups"]]
         if "/*ua-close-benefit*/" in script:
             return self.site.ui_close_benefit(self)
         if args is None and "miglog-cart-summary-totalprice" in script:

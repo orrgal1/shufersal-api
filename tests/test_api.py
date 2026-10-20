@@ -192,8 +192,11 @@ def test_checkout_quote_and_submit_drift_protection(monkeypatch):
     drift = client.post("/checkout/submit", json={**real, "confirm_total_ils": total + 10.0},
                         headers={**AUTH_HEADERS, "Idempotency-Key": "k3"})
     assert drift.status_code == 409 and drift.json()["error"]["code"] == "total_drift"
+    calls = checkout.await_count
     reuse = client.post("/checkout/submit", json=real, headers={**AUTH_HEADERS, "Idempotency-Key": "k3"})
-    assert reuse.status_code == 409 and reuse.json()["error"]["code"] == "idempotency_key_used"
+    # The same key replays the stored failure (code and message), without a re-run.
+    assert reuse.status_code == 409 and reuse.json() == drift.json(), reuse.text
+    assert reuse.headers.get("Idempotent-Replayed") == "true" and checkout.await_count == calls
 
     # The drift attempt consumed the quote: a new key on it is refused.
     consumed = client.post("/checkout/submit", json=real, headers={**AUTH_HEADERS, "Idempotency-Key": "k3b"})

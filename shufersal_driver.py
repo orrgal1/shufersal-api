@@ -1339,9 +1339,15 @@ class ShufersalDriver:
     #   לתשומת ליבך, / כרטיס אשראי שופרסל שלך לא מסומן / המבצעים למחזיקי כרטיס
     #   אשראי שופרסל - לא יכובדו / בכדי לממש את המבצעים יש להחליף לתשלום באשראי שופרסל
     # and a "הבנתי" ("understood") button. It is dismissed ONLY when it is the
-    # single visible such modal, its single clickable control is a plain
-    # "הבנתי" button (not in a form, no link target), and its text, apart from
-    # "הבנתי", is exactly those sentences. With click=false it only checks.
+    # single visible such modal, its clickable controls are one plain "הבנתי"
+    # button (not in a form, no link target) plus at most one empty X, and its
+    # text, apart from "הבנתי", is exactly those sentences. With click=false it
+    # only checks. Live markup at 08:36 2026-10-20 (it blocked that morning's run):
+    #   <div class="modal-dialog"><button type="button" aria-label="סגור" class="btnClose"></button>
+    #   <div class="messagesContainer">...<div class="btnContainer"><button type="button" class="btn radius">
+    #   הבנתי <span class="sr-only">הבנתי</span></button></div></div></div>
+    # i.e. an empty X closer next to "הבנתי", whose textContent reads "הבנתי הבנתי".
+    # Both only close the notice; "הבנתי" is the one clicked.
     UA_CREDIT_NOTICE_JS = """(click) => { /*ua-credit-notice*/
         const vis = (e) => !!e && e.getClientRects().length > 0 && getComputedStyle(e).visibility !== 'hidden';
         const norm = (t) => (t || '').replace(/\\s+/g, ' ').trim();
@@ -1350,11 +1356,19 @@ class ShufersalDriver:
         const m = ms[0];
         const ctrls = [...m.querySelectorAll('button, a, input, select, textarea, [role="button"], [onclick]')].filter(vis);
         const top = ctrls.filter(c => !ctrls.some(o => o !== c && o.contains(c)));
-        if (top.length !== 1) return {ok: false, why: 'controls:' + top.length};
-        const b = top[0];
+        const isX = (c) => c.tagName === 'BUTTON' && (c.getAttribute('type') || '').toLowerCase() === 'button'
+            && c.classList.contains('btnClose') && norm(c.getAttribute('aria-label')) === 'סגור'
+            && norm(c.textContent) === '' && c.children.length === 0 && !c.closest('form') && !c.disabled
+            && !c.hasAttribute('onclick') && !c.hasAttribute('href') && !c.hasAttribute('formaction');
+        const xs = top.filter(isX), others = top.filter(c => !isX(c));
+        if (xs.length > 1 || others.length !== 1) return {ok: false, why: 'controls:' + top.length};
+        const b = others[0];
         const label = norm((b.textContent || '') + ' ' + (b.value || ''));
         const aria = norm(b.getAttribute('aria-label'));
-        if (label !== 'הבנתי' || (aria && aria !== 'הבנתי')) return {ok: false, why: 'label'};
+        // "הבנתי", or "הבנתי הבנתי" from a screen-reader copy inside it (.sr-only).
+        const srOk = label === 'הבנתי הבנתי' && [...b.querySelectorAll('.sr-only')].length === 1
+            && norm(b.querySelector('.sr-only').textContent) === 'הבנתי';
+        if ((label !== 'הבנתי' && !srOk) || (aria && aria !== 'הבנתי')) return {ok: false, why: 'label'};
         if (b.closest('form') || b.disabled) return {ok: false, why: 'form'};
         const tag = b.tagName;
         if (tag === 'A' && !/^(#|javascript:void\\(0\\);?$|$)/.test(b.getAttribute('href') || '')) return {ok: false, why: 'href'};
@@ -1370,6 +1384,13 @@ class ShufersalDriver:
         if (!/^[\\s,.:!\\-–]*$/.test(rest)) return {ok: false, why: 'text'};
         if (click) b.click();
         return {ok: true};
+    }"""
+    # The visible popups' own text, for the error when a run stops on one.
+    UA_POPUP_TEXT_JS = """() => { /*ua-popup-text*/
+        const vis = (e) => !!e && e.getClientRects().length > 0 && getComputedStyle(e).visibility !== 'hidden';
+        return [...document.querySelectorAll('.modal, .generalErrorChat')].filter(m => vis(m) && m.id !== 'forgottenPwdModal')
+            .map(m => ({popup: m.id || String(m.className).slice(0, 60),
+                        text: (m.innerText || '').replace(/\\s+/g, ' ').trim().slice(0, 300)}));
     }"""
     # Inside the bank's 3-D Secure frame: the single visible code input.
     UA_FRAME_OTP_JS = """() => { /*ua-3ds-probe*/
@@ -1410,6 +1431,16 @@ class ShufersalDriver:
 
     async def _ua_sleep(self):
         await asyncio.sleep(config.UNATTENDED_POLL_SECONDS)
+
+    async def _ua_popup_fail(self, steps: List[str], message: str) -> APIException:
+        """checkout_blocked on a popup, with the popups' own text in the message and details."""
+        try:
+            texts = await self.page.evaluate(self.UA_POPUP_TEXT_JS) or []
+        except Exception:
+            texts = []
+        shown = "; ".join(f"{t.get('popup')}: \"{t.get('text')}\"" for t in texts if t.get("text"))
+        return self._ua_fail(steps, "checkout_blocked", message + (f" Popup text: {shown}" if shown else ""),
+                             details={"popups": texts} if texts else None)
 
     def _ua_fail(self, steps: List[str], code: str, message: str,
                  details: Optional[Dict[str, Any]] = None) -> APIException:
@@ -1494,9 +1525,9 @@ class ShufersalDriver:
         checkout_blocked, as for any other popup."""
         check = await self.page.evaluate(self.UA_CREDIT_NOTICE_JS, False)
         if not (check or {}).get("ok"):
-            raise self._ua_fail(steps, "checkout_blocked",
-                                f"An unexpected popup is open on the checkout page: {popups} "
-                                f"(not the plain card notice: {(check or {}).get('why')}).")
+            raise await self._ua_popup_fail(steps,
+                                            f"An unexpected popup is open on the checkout page: {popups} "
+                                            f"(not the plain card notice: {(check or {}).get('why')}).")
         done = await self.page.evaluate(self.UA_CREDIT_NOTICE_JS, True)
         if not (done or {}).get("ok"):
             raise self._ua_fail(steps, "checkout_blocked", "The card notice popup changed before it could be closed.")
@@ -1511,7 +1542,7 @@ class ShufersalDriver:
                 break
             if time.monotonic() > deadline:
                 raise self._ua_fail(steps, "checkout_blocked", "The card notice popup did not close.")
-        self._ua_log(steps, "closed the credit-card notice popup via its only button 'הבנתי'")
+        self._ua_log(steps, "closed the credit-card notice popup via its 'הבנתי' button")
 
     async def _ua_close_benefit_popup(self, steps: List[str], popups: List[str], dismissed: int):
         """Closes the credit-benefit popup by its exact X; any other popup stops
@@ -1520,7 +1551,7 @@ class ShufersalDriver:
             raise await self._ua_missing_products(steps)
         others = [p for p in popups if p != "creditBenefitProductModal"]
         if others:
-            raise self._ua_fail(steps, "checkout_blocked", f"An unexpected popup is open: {others}.")
+            raise await self._ua_popup_fail(steps, f"An unexpected popup is open: {others}.")
         if dismissed >= 3:
             raise self._ua_fail(steps, "checkout_blocked", "The credit-benefit popup does not close.")
         clicked = await self.page.evaluate(self.UA_CLOSE_BENEFIT_JS)
@@ -1609,8 +1640,8 @@ class ShufersalDriver:
                     notices += 1
                     continue
                 if state.get("popups"):
-                    raise self._ua_fail(steps, "checkout_blocked",
-                                        f"An unexpected popup is open on the checkout page: {state['popups']}.")
+                    raise await self._ua_popup_fail(steps,
+                                                    f"An unexpected popup is open on the checkout page: {state['popups']}.")
                 if state.get("placeButton"):
                     break
                 if time.monotonic() > deadline:
@@ -1661,8 +1692,8 @@ class ShufersalDriver:
                     notices += 1
                     continue
                 if state.get("popups") or state.get("errorPopup"):
-                    raise self._ua_fail(steps, "checkout_blocked",
-                                        f"A popup opened on the checkout page: {state.get('popups') or state.get('errorPopup')}.")
+                    raise await self._ua_popup_fail(steps,
+                                                    f"A popup opened on the checkout page: {state.get('popups') or state.get('errorPopup')}.")
                 break
             if state.get("cvvSelector"):
                 cvv = config.SHUFERSAL_CVV or ""

@@ -148,7 +148,8 @@ def test_other_checkout_popup_is_still_checkout_blocked(ua, client, site):
     q = _quote(client)
     res = _submit(client, q, "ua-other-pop")
     err = res.json()["error"]
-    assert err["code"] == "checkout_blocked" and "details" not in err
+    assert err["code"] == "checkout_blocked" and "unavailable_items" not in (err.get("details") or {})
+    assert err["details"]["popups"][0]["popup"] == "phoneCheckModal"
     assert site.place_clicks == 0
 
 
