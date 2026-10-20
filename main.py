@@ -43,6 +43,8 @@ SAFE_CHECKOUT_CODES = {
     "checkout_blocked", "confirmation_required", "idempotency_key_required", "idempotency_key_used",
     "live_checkout_disabled", "order_rejected", "checkout_not_configured", "browser_unavailable",
     "slot_select_failed", "checkout_unreachable", "quote_consumed", "cart_incomplete", "checkout_in_progress", "payment_method_unavailable", "invalid_input",
+    "order_over_cap", "order_outcome_unresolved", "reauth_failed", "sms_unavailable", "sms_code_timeout",
+    "sms_code_ambiguous",
 }
 
 logging.basicConfig(
@@ -320,6 +322,14 @@ async def submit_checkout(
     site total) and stops before placing the order. Placing a real order needs
     dry_run=false, confirm=true, a never-used Idempotency-Key and
     SHUFERSAL_LIVE_CHECKOUT_ENABLED=true. The cart is never modified.
+
+    Unattended mode (watched=false with SHUFERSAL_LIVE_CHECKOUT_ENABLED and
+    SHUFERSAL_UNATTENDED_CHECKOUT both on): the service clicks "מעבר לקופה",
+    closes popups, passes the SMS re-auth, re-verifies cart and total on the
+    checkout page, clicks place-order once, enters the 3-D Secure SMS code and
+    reads the order number from the confirmation page. Capped by
+    SHUFERSAL_MAX_ORDER_ILS. An ambiguous outcome blocks further orders until
+    resolved with `checkout_ledger.py resolve`.
     """
     quote = quote_store.get_quote(payload.quote_id)
     if not quote:
@@ -341,6 +351,7 @@ async def submit_checkout(
                            message="The expected cart does not match the quoted cart.")
 
     place_order = not payload.dry_run
+    unattended = False
     if place_order:
         if payload.confirm is not True:
             raise APIException(status_code=400, code="confirmation_required",
@@ -351,7 +362,16 @@ async def submit_checkout(
         if not (config.LIVE_CHECKOUT_ENABLED or config.MOCK_MODE):
             raise APIException(status_code=403, code="live_checkout_disabled",
                                message="Live order placement is disabled on this service.")
+        unattended = (not payload.watched and config.UNATTENDED_CHECKOUT and config.LIVE_CHECKOUT_ENABLED
+                      and not config.MOCK_MODE)
+        if unattended and payload.confirm_total_ils > config.MAX_ORDER_ILS:
+            raise APIException(status_code=409, code="order_over_cap",
+                               message=f"confirm_total_ils exceeds SHUFERSAL_MAX_ORDER_ILS ({config.MAX_ORDER_ILS}).")
         previous = checkout_ledger.claim(idempotency_key, payload.quote_id)
+        if previous is not None and previous["state"] == "blocked_unresolved":
+            raise APIException(status_code=409, code="order_outcome_unresolved",
+                               message="An earlier order attempt has an unknown outcome; no further orders until Or "
+                                       "checks the site and runs `checkout_ledger.py resolve <key> placed|not_placed`.")
         if previous is not None and previous["state"] == "quote_consumed":
             raise APIException(status_code=409, code="quote_consumed",
                                message="This quote already had a placement attempt. Get a new quote and check the cart.")
@@ -372,6 +392,8 @@ async def submit_checkout(
             confirm_total_ils=payload.confirm_total_ils,
             place_order=place_order,
             watched=payload.watched,
+            unattended=unattended,
+            on_place_order=(lambda: checkout_ledger.mark(idempotency_key, "placing")) if place_order else None,
         )
     except APIException as exc:
         if place_order:

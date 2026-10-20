@@ -7,6 +7,7 @@ site, and keeps a cart so write paths can be verified end to end.
 import json
 import sys
 import types
+from datetime import datetime, timedelta, timezone
 from html import escape
 from urllib.parse import parse_qs, urlparse
 
@@ -85,6 +86,32 @@ class FakeSite:
         self._session_expired = False
         self.anon_cart = []
         self.page_loads = 0
+        # ---- Unattended checkout UI (live markup 2026-10-20, see the driver) ----
+        self.sms = FakeSmsInbox()
+        self.login_code = "482913"
+        self.benefit_popup = True          # #creditBenefitProductModal after "מעבר לקופה"
+        self.benefit_continue_adds = 0     # "המשך לתשלום" would add items: must never be clicked
+        self.reauth_modal = True           # #forgottenPwdModal (password / SMS)
+        self.login_sms_sender = "SHUFERSAL"
+        self.login_sms_text = "קוד האימות שלך לשופרסל הוא: {code}"
+        self.send_login_sms = True
+        self.stale_login_sms = False       # also deliver an older code from before the trigger
+        self.ui = {"modal": None, "sms_tab": False, "sms_sent": False, "sms_value": "", "otp_error": False,
+                   "three_ds": False, "error_popup": None, "cvv_value": None, "checkout_popups": []}
+        self.checkout_popups = []          # popups the checkout page opens on load (closed by their X)
+        self.checkout_cvv_field = False
+        self.place_clicks = 0
+        self.after_click = "confirm"       # confirm | 3ds | error | nothing | confirm_no_number
+        self.issuer_code = "771204"
+        self.issuer_sender = "Isracard"
+        self.issuer_amount = None          # None: the order total
+        self.issuer_last4 = "1111"
+        self.issuer_merchant = "Shufersal Online"
+        self.send_issuer_sms = True
+        self.three_ds_inputs = 1
+        self.three_ds_codes = []           # codes typed into the bank frame
+        self.cart_change_on_checkout = False
+        self.checkout_total_delta = 0.0    # the checkout page total differs from the cart summary
 
     def expire_session(self):
         """The server forgets the session (idle timeout); takes effect on the next request."""
@@ -239,7 +266,8 @@ class FakeSite:
             if self.cost_summary is not None:
                 return 200, url, json.dumps(self.cost_summary)
             subtotal = sum(CATALOG[e["code"]]["price"] * e["qty"] for e in self.cart)
-            return 200, url, json.dumps({"subTotal": {"value": round(subtotal, 2)}, "totalPrice": {"value": self.order_total()}})
+            return 200, url, json.dumps({"subTotal": {"value": round(subtotal, 2)},
+                                         "totalAmount": {"value": round(self.order_total() + self.checkout_total_delta, 2)}})
         if path == "/online/he/checkout/placeOrder":
             self.orders_placed += 1
             self.place_order_query = q
@@ -247,6 +275,157 @@ class FakeSite:
         if path == "/online/he/my-account":
             return 200, BASE + "/online/he/my-account/personal-area", "<html></html>"
         return 404, url, "not found"
+
+
+    # ---- unattended UI ----
+    def ui_state(self, page):
+        path = urlparse(page._url).path
+        on_summary = path.rstrip("/").endswith("/cart/cartsummary")
+        on_checkout = path.rstrip("/").endswith("/miglog-checkout")
+        ui = self.ui
+        popups = []
+        if ui["modal"] == "benefit":
+            popups.append("creditBenefitProductModal")
+        if on_checkout:
+            popups += ui["checkout_popups"]
+        return {
+            "path": path, "href": page._url, "loggedIn": self.session_logged_in,
+            "checkoutLink": on_summary, "pwdModal": ui["modal"] == "pwd",
+            "smsInput": ui["modal"] == "pwd" and ui["sms_sent"], "strongAuth": False,
+            "otpError": "קוד שגוי" if ui["otp_error"] else None, "popups": popups,
+            "placeButton": on_checkout and not ui["three_ds"],
+            "threeDS": on_checkout and ui["three_ds"], "errorPopup": ui["error_popup"],
+            "cvvSelector": "#cvv" if on_checkout and self.checkout_cvv_field else None,
+        }
+
+    def ui_click(self, page, sel):
+        ui = self.ui
+        path = urlparse(page._url).path
+        if sel == ".miglog-cart-summary-checkoutLink" and path.endswith("/cart/cartsummary"):
+            ui.update(modal=None, sms_tab=False, sms_sent=False, sms_value="", otp_error=False, three_ds=False,
+                      error_popup=None, checkout_popups=[])
+            self.checkout_reauthed = False  # the re-auth is asked again for every checkout
+            ui["modal"] = "benefit" if self.benefit_popup else ("pwd" if self.reauth_modal else None)
+            if ui["modal"] is None:
+                self.checkout_reauthed = True
+                page._url = BASE + "/online/he/miglog-checkout"
+            return True
+        if sel == '#forgottenPwdModal a.tab[href="#smsTab"]' and ui["modal"] == "pwd":
+            ui["sms_tab"] = True
+            return True
+        if sel == "#sendSmsBtn" and ui["modal"] == "pwd" and ui["sms_tab"]:
+            ui["sms_sent"] = True
+            if self.send_login_sms:
+                self.sms.add(self.login_sms_sender, self.login_sms_text.format(code=self.login_code))
+            return True
+        if sel == "#forgottenPwdModal .js-otp-submit-passwordModal" and ui["modal"] == "pwd":
+            if len(ui["sms_value"]) != 6:
+                return False  # disabled
+            if ui["sms_value"] == self.login_code:
+                ui["modal"] = None
+                self.checkout_reauthed = True
+                page._url = BASE + "/online/he/miglog-checkout"
+                ui["checkout_popups"] = list(self.checkout_popups)
+                if self.cart_change_on_checkout:
+                    self.cart.append({"entry": len(self.cart), "code": "4131074", "qty": 1.0})
+            else:
+                ui["otp_error"] = True
+            return True
+        if sel == "a.btnConfirm" and path.endswith("/miglog-checkout") and not ui["checkout_popups"]:
+            self.place_clicks += 1
+            if self.after_click == "confirm":
+                self.orders_placed += 1
+                page._url = self.confirmation_url
+            elif self.after_click == "confirm_no_number":
+                self.orders_placed += 1
+                page._url = BASE + "/online/he/checkout/orderConfirmation"
+                self.confirmation_html = "<p>תודה!</p>"
+            elif self.after_click == "3ds":
+                ui["three_ds"] = True
+                if self.send_issuer_sms:
+                    amount = self.order_total() if self.issuer_amount is None else self.issuer_amount
+                    self.sms.add(self.issuer_sender, (
+                        f"חשוב מאוד, לתשומת ליבך- זיהינו כעת עסקה בסכום {amount:.2f} ILS ב {self.issuer_merchant} "
+                        f"בכרטיסך {self.issuer_last4}, ... הקוד שלך להשלמת העסקה הינו {self.issuer_code}\n"
+                        "תמיד לשירותך, ישראכרט"))
+            elif self.after_click == "error":
+                ui["error_popup"] = "אירעה שגיאה בתשלום"
+            return True
+        return False
+
+    def ui_fill(self, page, sel, value):
+        if sel == "#smsCodeInput" and self.ui["modal"] == "pwd":
+            self.ui["sms_value"] = value
+            return True
+        if sel == "#cvv":
+            self.ui["cvv_value"] = value
+            return True
+        return False
+
+    def ui_dismiss(self, page):
+        closed = []
+        if self.ui["modal"] == "benefit":
+            closed.append("creditBenefitProductModal")
+            self.ui["modal"] = "pwd" if self.reauth_modal else None
+            if self.ui["modal"] is None:
+                self.checkout_reauthed = True
+                page._url = BASE + "/online/he/miglog-checkout"
+        if urlparse(page._url).path.endswith("/miglog-checkout") and self.ui["checkout_popups"]:
+            closed += self.ui["checkout_popups"]
+            self.ui["checkout_popups"] = []
+        return closed
+
+    def three_ds_submit(self, page, code):
+        if self.three_ds_inputs != 1:
+            return f"inputs:{self.three_ds_inputs}"
+        self.three_ds_codes.append(code)
+        self.ui["three_ds"] = False
+        if code == self.issuer_code:
+            self.orders_placed += 1
+            page._url = self.confirmation_url
+        else:
+            self.ui["error_popup"] = "התשלום נכשל"
+        return "clicked"
+
+
+class FakeSmsInbox:
+    """Stand-in for the sms-api /messages list (newest first)."""
+
+    def __init__(self):
+        self.messages = []
+        self.rowid = 3150
+        self.fail = False
+
+    def add(self, sender, text, age_seconds=0.0):
+        self.rowid += 1
+        when = datetime.now(timezone.utc) - timedelta(seconds=age_seconds)
+        self.messages.insert(0, {"id": str(self.rowid), "rowid": self.rowid, "service": "SMS", "sender": sender,
+                                 "received_at": when.isoformat(), "direction": "incoming", "text": text})
+
+    def fetch(self):
+        if self.fail:
+            raise OSError("sms-api down")
+        return [dict(m) for m in self.messages[:30]]
+
+
+class FakeFrame:
+    def __init__(self, site, page):
+        self.site, self.page, self.child_frames = site, page, []
+
+    async def evaluate(self, script, args=None):
+        if "/*ua-3ds-probe*/" in script:
+            return {"inputs": self.site.three_ds_inputs}
+        if "/*ua-3ds-submit*/" in script:
+            return self.site.three_ds_submit(self.page, args)
+        raise AssertionError("unexpected frame script")
+
+
+class FakeHandle:
+    def __init__(self, frame):
+        self.frame = frame
+
+    async def content_frame(self):
+        return self.frame
 
 
 class FakePage:
@@ -300,9 +479,22 @@ class FakePage:
     async def content(self):
         return self.site.confirmation_html if "order" in self._url.lower() else "<html></html>"
 
+    async def query_selector(self, sel):
+        if sel == ".creditCardOtpPopup iframe" and self.site.ui["three_ds"]:
+            return FakeHandle(FakeFrame(self.site, self))
+        return None
+
     async def evaluate(self, script, args=None):
         if self.closed:
             raise Exception("Target page, context or browser has been closed")
+        if "/*ua-state*/" in script:
+            return self.site.ui_state(self)
+        if "/*ua-click*/" in script:
+            return self.site.ui_click(self, args)
+        if "/*ua-fill*/" in script:
+            return self.site.ui_fill(self, args[0], args[1])
+        if "/*ua-dismiss*/" in script:
+            return self.site.ui_dismiss(self)
         if args is None and "miglog-cart-summary-totalprice" in script:
             return self.site.cart_summary_state(urlparse(self._url).path)
         if args is None and "miglog.account" in script:  # login marker set when the page loaded

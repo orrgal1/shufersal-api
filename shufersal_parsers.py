@@ -336,7 +336,9 @@ def parse_order_number(url: str, html: str) -> Optional[str]:
 
 # ==================== Checkout ====================
 
-TOTAL_KEYS = ("totalPriceWithDelivery", "totalPriceWithTax", "totalPrice")
+# totalAmount is what the checkout page itself shows as the amount to pay
+# (StickyTotal.vue: totalPrice = costSummary.totalAmount; site JS 2026-10-20).
+TOTAL_KEYS = ("totalAmount", "totalPriceWithDelivery", "totalPriceWithTax", "totalPrice")
 
 
 def extract_site_total(data: Any) -> Optional[float]:

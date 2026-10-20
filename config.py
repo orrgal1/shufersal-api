@@ -57,3 +57,41 @@ CHECKOUT_LEDGER = os.getenv("SHUFERSAL_CHECKOUT_LEDGER", "./.runtime/checkout_le
 # the service waits this long for Or to finish payment and place the order.
 WATCH_TIMEOUT_SECONDS = int(os.getenv("SHUFERSAL_WATCH_TIMEOUT_SECONDS", "900"))
 WATCH_POLL_SECONDS = float(os.getenv("SHUFERSAL_WATCH_POLL_SECONDS", "3"))
+
+# Unattended checkout: with watched=false and BOTH this flag and
+# SHUFERSAL_LIVE_CHECKOUT_ENABLED on, the service itself clicks "מעבר לקופה",
+# passes the SMS re-auth, pays with the saved card and handles 3-D Secure, reading
+# the one-time codes from the local sms-api. Off by default.
+UNATTENDED_CHECKOUT = os.getenv("SHUFERSAL_UNATTENDED_CHECKOUT", "false").strip().lower() in ("true", "1", "yes")
+# Hard cap on the confirmed total of an unattended order (ILS).
+MAX_ORDER_ILS = float(os.getenv("SHUFERSAL_MAX_ORDER_ILS", "600"))
+
+# Local read-only sms-api (macOS Messages). It accepts the gateway's shared
+# bearer token, which the gateway launcher passes to this service as
+# SHUFERSAL_API_TOKEN.
+SMS_API_URL = os.getenv("SHUFERSAL_SMS_API_URL", "http://127.0.0.1:8004")
+
+
+def sms_api_token() -> str:
+    for name in ("SMS_API_TOKEN", "SHARED_BEARER_TOKEN"):
+        if os.getenv(name, "").strip():
+            return os.getenv(name).strip()
+    token_file = Path(os.getenv("SHUFERSAL_SMS_API_TOKEN_FILE", "../sms-api/.api_token"))
+    if token_file.exists():
+        return token_file.read_text(encoding="utf-8").strip()
+    return os.getenv("SHUFERSAL_API_TOKEN", "").strip()
+
+
+# Expected SMS senders: Shufersal's re-auth code and the card issuer's 3-D Secure code.
+LOGIN_SMS_SENDER = os.getenv("SHUFERSAL_LOGIN_SMS_SENDER", "SHUFERSAL")
+CARD_SMS_SENDER = os.getenv("SHUFERSAL_CARD_SMS_SENDER", "Isracard")
+# The merchant name in the issuer's 3-D Secure text must contain one of these (case-insensitive).
+THREE_DS_MERCHANT_HINTS = [h.strip().lower() for h in
+                           os.getenv("SHUFERSAL_3DS_MERCHANT_HINTS", "shufersal,שופרסל").split(",") if h.strip()]
+SMS_CODE_MAX_AGE_SECONDS = 300
+SMS_WAIT_SECONDS = float(os.getenv("SHUFERSAL_SMS_WAIT_SECONDS", "180"))
+SMS_POLL_SECONDS = float(os.getenv("SHUFERSAL_SMS_POLL_SECONDS", "3"))
+# How long to wait after the place-order click for the confirmation page / 3DS.
+UNATTENDED_RESULT_SECONDS = float(os.getenv("SHUFERSAL_UNATTENDED_RESULT_SECONDS", "300"))
+UNATTENDED_STEP_SECONDS = float(os.getenv("SHUFERSAL_UNATTENDED_STEP_SECONDS", "60"))
+UNATTENDED_POLL_SECONDS = float(os.getenv("SHUFERSAL_UNATTENDED_POLL_SECONDS", "1"))

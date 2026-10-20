@@ -86,6 +86,8 @@ class ShufersalDriver:
         # session with an EMPTY cart (HTTP 200); see _session_read.
         self._page_session: Optional[str] = None
         self._page_loaded_at: float = 0.0
+        from sms_codes import SmsCodeReader
+        self.sms_reader = SmsCodeReader()
 
         # Internal mock store used only when MOCK_MODE=True (tests/demo).
         self._mock_logged_in = True
@@ -970,6 +972,8 @@ class ShufersalDriver:
         confirm_total_ils: float,
         place_order: bool,
         watched: bool = False,
+        unattended: bool = False,
+        on_place_order=None,
     ) -> Dict[str, Any]:
         async with self._guard():
             self._checkout_active = True
@@ -983,7 +987,8 @@ class ShufersalDriver:
                     if not await self._start_live(headless=False):
                         raise APIException(status_code=503, code="browser_unavailable",
                                            message="Could not open a visible browser window for the watched checkout.")
-                return await self._checkout_unlocked(slot_id, expected_cart_hash, confirm_total_ils, place_order, watched)
+                return await self._checkout_unlocked(slot_id, expected_cart_hash, confirm_total_ils, place_order, watched,
+                                                     unattended=unattended, on_place_order=on_place_order)
             finally:
                 try:
                     if relaunched:
@@ -994,7 +999,8 @@ class ShufersalDriver:
     async def _page_state(self) -> Dict[str, Any]:
         return await self.page.evaluate(self.CHECKOUT_STATE_JS)
 
-    async def _checkout_unlocked(self, slot_id, expected_cart_hash, confirm_total_ils, place_order, watched):
+    async def _checkout_unlocked(self, slot_id, expected_cart_hash, confirm_total_ils, place_order, watched,
+                                 unattended=False, on_place_order=None):
         """Walks checkout: verify cart -> select slot -> open the cart summary and
         read the site total -> try the checkout page, then
           - place_order=False: stop (dry run);
@@ -1002,6 +1008,8 @@ class ShufersalDriver:
             "מעבר לקופה" button, clears the password/SMS step, the PayMe card field
             and 3-D Secure, and clicks the site's own place-order button); the
             service waits for the confirmation page and returns its order number;
+          - unattended (both flags on, watched=false): the service walks the site's
+            own UI like Or would (see _unattended_place);
           - otherwise: call the site's placeOrder itself (only with no blockers).
         Never touches the cart contents.
 
@@ -1021,6 +1029,8 @@ class ShufersalDriver:
             raise APIException(status_code=409, code="cart_mismatch",
                                message="The cart no longer matches the expected contents.")
 
+        unattended = bool(unattended and place_order and not watched)
+        handled = watched or unattended  # the password/SMS and card steps are passed in the browser
         if config.MOCK_MODE:
             site_total = summary["estimated_total_ils"]
             result = {"summary": summary, "site_total_ils": site_total, "blockers": [], "warnings": [],
@@ -1077,16 +1087,16 @@ class ShufersalDriver:
         gated = not reached and path.rstrip("/").endswith("/cart/cartsummary")
         if gated:
             # Or passes this gate himself in a watched run; nothing else can.
-            (warnings if watched else blockers).append(
+            (warnings if handled else blockers).append(
                 "the checkout page needs the account password or an SMS code first (the site redirects it to "
                 "the cart summary); in the visible window click 'מעבר לקופה' and enter it")
         elif not reached:
             blockers.append(f"checkout page redirected to {path or 'unknown'}")
         if page_state.get("reauth"):
-            (warnings if watched else blockers).append(
+            (warnings if handled else blockers).append(
                 "the site asks for the account password or an SMS code before checkout")
         if page_state.get("cvv"):
-            (warnings if watched else blockers).append(
+            (warnings if handled else blockers).append(
                 "the checkout page shows a CVV / PayMe card field; the service never types card data")
 
         # 4. The site's own total for the order: the checkout page's cost summary
@@ -1129,6 +1139,8 @@ class ShufersalDriver:
                                message="Checkout cannot be completed: " + "; ".join(blockers))
         if watched:
             return dict(result, **(await self._await_handover()))
+        if unattended:
+            return dict(result, **(await self._unattended_place(summary, confirm_total_ils, result, on_place_order)))
 
         jwt = ""
         if page_state.get("threeDS"):
@@ -1164,6 +1176,340 @@ class ShufersalDriver:
                                message=f"The site rejected the order ({outcome.get('code')}).")
         # The request went out but the answer is not understood: the order may exist.
         return dict(result, status="outcome_unknown", order_id=None)
+
+    # ==================== Unattended checkout ====================
+    #
+    # Evidence (live 2026-10-20, headless copy of the profile, and the site's
+    # main / checkout JS bundles):
+    #   * cart summary "מעבר לקופה" = .miglog-cart-summary-checkoutLink;
+    #   * it can first open #creditBenefitProductModal. Its "המשך לתשלום" button
+    #     POSTs /salesPromotions/addToCart/grid (adds items), so only its close
+    #     button (.btnClose) is ever clicked; closing it continues to the re-auth;
+    #   * re-auth = #forgottenPwdModal, tabs a.tab[href="#passwordTab"|"#smsTab"];
+    #     #sendSmsBtn loads the OTP form (POST /otp/send/jsp, SMS to the account
+    #     phone), code input #smsCodeInput (6 digits, enabled on "input"),
+    #     submit .js-otp-submit-passwordModal -> POST /otp/checkout/validate ->
+    #     location = /miglog-checkout; a wrong code shows .otpError;
+    #   * checkout page (Vue, inferred from its JS): place-order button
+    #     a.btnConfirm ("אישור תשלום") -> placeOrder?jwtPayme=..&after3ds=false;
+    #     a 3-D Secure answer opens .creditCardOtpPopup with an <iframe> of the
+    #     bank's page; on success the site calls placeOrder again (after3ds=true)
+    #     and navigates to the confirmation page; errors open .generalErrorChat.
+    UA_STATE_JS = """() => { /*ua-state*/
+        const vis = (e) => !!e && e.getClientRects().length > 0 && getComputedStyle(e).visibility !== 'hidden';
+        const q = (s) => document.querySelector(s);
+        const popups = [...document.querySelectorAll('.modal')].filter(m => vis(m) && m.id !== 'forgottenPwdModal'
+            && !m.classList.contains('modalFromSide') && !m.classList.contains('creditCardOtpPopup')
+            && !m.classList.contains('generalErrorChat')).map(m => m.id || String(m.className).slice(0, 60));
+        const err = [...document.querySelectorAll('.otpError')].find(e => vis(e) && !e.classList.contains('hidden'));
+        const gen = [...document.querySelectorAll('.generalErrorChat')].find(vis);
+        const cvv = [...document.querySelectorAll('input[name*="cvv" i], input[id*="cvv" i], .form-group.cvv input')].find(vis);
+        const a = window.miglog && window.miglog.account;
+        return {
+            path: location.pathname, href: location.href,
+            loggedIn: a && typeof a.anonymous === 'boolean' ? !a.anonymous : null,
+            checkoutLink: vis(q('.miglog-cart-summary-checkoutLink')),
+            pwdModal: vis(q('#forgottenPwdModal')), smsInput: vis(q('#smsCodeInput')),
+            strongAuth: vis(q('#strongAuthModal')), otpError: err ? err.textContent.trim().slice(0, 120) : null,
+            popups, placeButton: vis(q('a.btnConfirm')), threeDS: vis(q('.creditCardOtpPopup')),
+            errorPopup: gen ? gen.textContent.trim().replace(/\\s+/g, ' ').slice(0, 160) : null,
+            cvvSelector: cvv ? (cvv.id ? '#' + cvv.id : (cvv.name ? 'input[name="' + cvv.name + '"]' : '.form-group.cvv input')) : null,
+        };
+    }"""
+    UA_CLICK_JS = """(sel) => { /*ua-click*/
+        const vis = (e) => !!e && e.getClientRects().length > 0 && getComputedStyle(e).visibility !== 'hidden';
+        const el = [...document.querySelectorAll(sel)].find(e => vis(e) && !e.disabled && !e.classList.contains('disabled'));
+        if (!el) return false;
+        el.click();
+        return true;
+    }"""
+    UA_FILL_JS = """([sel, value]) => { /*ua-fill*/
+        const el = document.querySelector(sel);
+        if (!el) return false;
+        el.focus();
+        el.value = value;
+        el.dispatchEvent(new Event('input', {bubbles: true}));
+        el.dispatchEvent(new Event('change', {bubbles: true}));
+        return true;
+    }"""
+    # Closes every blocking popup except the re-auth modal by its close control only.
+    UA_DISMISS_JS = """() => { /*ua-dismiss*/
+        const vis = (e) => !!e && e.getClientRects().length > 0 && getComputedStyle(e).visibility !== 'hidden';
+        const closed = [];
+        for (const m of document.querySelectorAll('.modal')) {
+            if (!vis(m) || m.id === 'forgottenPwdModal' || m.classList.contains('modalFromSide')
+                || m.classList.contains('creditCardOtpPopup') || m.classList.contains('generalErrorChat')) continue;
+            const btn = [...m.querySelectorAll('.btnClose, [data-dismiss="modal"], button.close')].find(vis);
+            if (btn) { btn.click(); closed.push(m.id || String(m.className).slice(0, 60)); }
+        }
+        return closed;
+    }"""
+    # Inside the bank's 3-D Secure frame: the single visible code input.
+    UA_FRAME_OTP_JS = """() => { /*ua-3ds-probe*/
+        const vis = (e) => !!e && e.getClientRects().length > 0 && getComputedStyle(e).visibility !== 'hidden';
+        const inputs = [...document.querySelectorAll('input')].filter(e => vis(e) && !e.disabled
+            && ['text', 'tel', 'password', 'number', ''].includes((e.getAttribute('type') || '').toLowerCase()));
+        return {inputs: inputs.length};
+    }"""
+    UA_FRAME_SUBMIT_JS = """(code) => { /*ua-3ds-submit*/
+        const vis = (e) => !!e && e.getClientRects().length > 0 && getComputedStyle(e).visibility !== 'hidden';
+        const inputs = [...document.querySelectorAll('input')].filter(e => vis(e) && !e.disabled
+            && ['text', 'tel', 'password', 'number', ''].includes((e.getAttribute('type') || '').toLowerCase()));
+        if (inputs.length !== 1) return 'inputs:' + inputs.length;
+        const el = inputs[0];
+        el.focus(); el.value = code;
+        el.dispatchEvent(new Event('input', {bubbles: true}));
+        el.dispatchEvent(new Event('change', {bubbles: true}));
+        const form = el.form;
+        const cands = [...(form || document).querySelectorAll('button, input[type=submit]')].filter(b => vis(b) && !b.disabled);
+        const btn = cands.find(b => (b.type || '').toLowerCase() === 'submit')
+            || cands.find(b => /אישור|שלח|המשך|submit|continue|confirm|verify/i.test(b.textContent || b.value || ''));
+        if (btn) { btn.click(); return 'clicked'; }
+        if (form) { form.requestSubmit ? form.requestSubmit() : form.submit(); return 'submitted'; }
+        return 'no-submit';
+    }"""
+
+    def _ua_log(self, steps: List[str], step: str):
+        """A short, non-secret progress line (never a code, CVV or card number)."""
+        steps.append(step)
+        logger.info(f"unattended checkout: {step}")
+
+    async def _ua_state(self) -> Dict[str, Any]:
+        return await self.page.evaluate(self.UA_STATE_JS)
+
+    async def _ua_sleep(self):
+        await asyncio.sleep(config.UNATTENDED_POLL_SECONDS)
+
+    def _ua_fail(self, steps: List[str], code: str, message: str) -> APIException:
+        """Before the place-order click: a clean failure, no order was placed."""
+        self._ua_log(steps, f"stopped before placing the order: {code}")
+        return APIException(status_code=409, code=code, message=message)
+
+    @staticmethod
+    def _on_checkout_page(path: str) -> bool:
+        p = (path or "").rstrip("/")
+        return p.endswith("/miglog-checkout") or p.endswith("/checkout") or "/checkout/multi" in p
+
+    async def _ua_sms_reauth(self, steps: List[str]):
+        """The re-auth modal: choose SMS, send the code, read it via sms-api, enter it."""
+        from sms_codes import SmsCodeError
+        await self.page.evaluate(self.UA_CLICK_JS, '#forgottenPwdModal a.tab[href="#smsTab"]')
+        await self._ua_sleep()
+        try:
+            base = await self.sms_reader.baseline()
+        except SmsCodeError as e:
+            raise self._ua_fail(steps, e.code, str(e))
+        if not await self.page.evaluate(self.UA_CLICK_JS, "#sendSmsBtn"):
+            raise self._ua_fail(steps, "reauth_failed", "The SMS option of the re-auth window could not be chosen.")
+        self._ua_log(steps, "re-auth: SMS code requested")
+        deadline = time.monotonic() + config.UNATTENDED_STEP_SECONDS
+        while not (await self._ua_state()).get("smsInput"):
+            if time.monotonic() > deadline:
+                raise self._ua_fail(steps, "reauth_failed", "The SMS code field did not appear.")
+            await self._ua_sleep()
+        try:
+            code = await self.sms_reader.wait_for_code("login", base)
+        except SmsCodeError as e:
+            raise self._ua_fail(steps, e.code, str(e))
+        await self.page.evaluate(self.UA_FILL_JS, ["#smsCodeInput", code])
+        code = None
+        await self._ua_sleep()
+        if not await self.page.evaluate(self.UA_CLICK_JS, "#forgottenPwdModal .js-otp-submit-passwordModal"):
+            raise self._ua_fail(steps, "reauth_failed", "The re-auth confirm button stayed disabled.")
+        self._ua_log(steps, "re-auth: SMS code entered and confirmed")
+
+    async def _ua_reach_checkout(self, steps: List[str]) -> Dict[str, Any]:
+        """Cart summary -> "מעבר לקופה" -> popups -> SMS re-auth -> checkout page."""
+        await self.page.goto(config.SHUFERSAL_BASE_URL + BASE + "/cart/cartsummary",
+                             wait_until="domcontentloaded", timeout=45000)
+        await self.page.wait_for_timeout(4000)
+        state = await self._ua_state()
+        if not state.get("checkoutLink"):
+            raise self._ua_fail(steps, "checkout_unreachable", "The 'מעבר לקופה' button is not on the cart summary page.")
+        if not await self.page.evaluate(self.UA_CLICK_JS, ".miglog-cart-summary-checkoutLink"):
+            raise self._ua_fail(steps, "checkout_unreachable", "The 'מעבר לקופה' button could not be clicked.")
+        self._ua_log(steps, "clicked 'מעבר לקופה'")
+        reauthed, dismissed = False, 0
+        deadline = time.monotonic() + config.UNATTENDED_STEP_SECONDS + config.SMS_WAIT_SECONDS
+        while time.monotonic() < deadline:
+            await self._ua_sleep()
+            try:
+                state = await self._ua_state()
+            except Exception:
+                continue  # the page is navigating
+            if self._on_checkout_page(state.get("path")):
+                self._ua_log(steps, "reached the checkout page")
+                return state
+            if state.get("strongAuth"):
+                raise self._ua_fail(steps, "reauth_failed", "The site asks for strong authentication; not automated.")
+            if state.get("otpError"):
+                raise self._ua_fail(steps, "reauth_failed", "The site rejected the SMS code.")
+            if state.get("pwdModal"):
+                if reauthed:
+                    continue  # waiting for the site to navigate after the code
+                await self._ua_sms_reauth(steps)
+                reauthed = True
+                continue
+            if state.get("popups"):
+                if dismissed >= 5:
+                    raise self._ua_fail(steps, "checkout_blocked", f"Popups keep opening: {state['popups']}.")
+                closed = await self.page.evaluate(self.UA_DISMISS_JS)
+                dismissed += 1
+                self._ua_log(steps, f"closed popup(s) {closed or state['popups']}")
+        raise self._ua_fail(steps, "checkout_unreachable", "The checkout page did not open in time.")
+
+    async def _unattended_place(self, summary, confirm_total_ils, result, on_place_order) -> Dict[str, Any]:
+        from sms_codes import SmsCodeError
+        steps: List[str] = []
+        result["checks"]["unattended_steps"] = steps
+        warnings = result["warnings"]
+        if confirm_total_ils > config.MAX_ORDER_ILS + 1e-9:
+            raise self._ua_fail(steps, "order_over_cap", f"The order total exceeds SHUFERSAL_MAX_ORDER_ILS ({config.MAX_ORDER_ILS}).")
+        self._ua_log(steps, "start")
+        try:
+            await self._ua_reach_checkout(steps)
+            # The checkout app renders asynchronously; wait for its place-order button.
+            deadline = time.monotonic() + config.UNATTENDED_STEP_SECONDS
+            while True:
+                try:
+                    state = await self._ua_state()
+                except Exception:
+                    state = {}
+                if state.get("errorPopup"):
+                    raise self._ua_fail(steps, "checkout_blocked", f"The checkout page shows an error: {state['errorPopup']}")
+                if state.get("popups"):
+                    closed = await self.page.evaluate(self.UA_DISMISS_JS)
+                    self._ua_log(steps, f"closed popup(s) on the checkout page {closed or state['popups']}")
+                elif state.get("placeButton"):
+                    break
+                if time.monotonic() > deadline:
+                    raise self._ua_fail(steps, "checkout_blocked", "The checkout page's place-order button did not appear.")
+                await self._ua_sleep()
+            # Re-verify on the checkout page itself: the cart and the site's own total.
+            self._page_session = await self._session_id()
+            self._page_loaded_at = time.monotonic()
+            cart = await self._get_cart_unlocked()
+            if cart["cart_hash"] != summary["cart_hash"]:
+                raise self._ua_fail(steps, "cart_mismatch", "The cart changed on the way to the checkout page.")
+            status, _, text = await self._fetch(f"{BASE}/checkout/costSummary/direct")
+            try:
+                checkout_total = extract_site_total(json.loads(text)) if status == 200 else None
+            except ValueError:
+                checkout_total = None
+            if checkout_total is None:
+                raise self._ua_fail(steps, "checkout_blocked", "Could not read the total on the checkout page.")
+            result["site_total_ils"] = checkout_total
+            result["checks"]["site_total_source"] = "checkout"
+            if abs(checkout_total - confirm_total_ils) > 0.01:
+                raise self._ua_fail(steps, "total_drift", f"The checkout page total ({checkout_total} ILS) differs from confirm_total_ils.")
+            if checkout_total > config.MAX_ORDER_ILS + 1e-9:
+                raise self._ua_fail(steps, "order_over_cap", "The checkout total exceeds SHUFERSAL_MAX_ORDER_ILS.")
+            self._ua_log(steps, f"checkout total verified ({checkout_total} ILS)")
+            state = await self._ua_state()
+            if not self._on_checkout_page(state.get("path")) or not state.get("placeButton"):
+                raise self._ua_fail(steps, "checkout_blocked", "Left the checkout page while verifying it.")
+            if state.get("cvvSelector"):
+                cvv = config.SHUFERSAL_CVV or ""
+                if not re.fullmatch(r"\d{3,4}", cvv):
+                    raise self._ua_fail(steps, "checkout_not_configured", "The checkout asks for the CVV but SHUFERSAL_CVV is not set.")
+                await self.page.evaluate(self.UA_FILL_JS, [state["cvvSelector"], cvv])
+                self._ua_log(steps, "entered the saved card's CVV")
+            base = await self.sms_reader.baseline()
+        except APIException:
+            raise
+        except SmsCodeError as e:
+            raise self._ua_fail(steps, e.code, str(e))
+        except Exception as e:
+            raise self._ua_fail(steps, "checkout_unreachable", f"Unattended checkout failed before placing the order ({type(e).__name__}).")
+
+        # ---------- The place-order click: at most once; from here every failure is "unknown" ----------
+        if on_place_order:
+            on_place_order()
+        self._ua_log(steps, "clicking the place-order button (once)")
+        try:
+            clicked = await self.page.evaluate(self.UA_CLICK_JS, "a.btnConfirm")
+        except Exception:
+            clicked = None
+        if clicked is False:
+            # The click handler never ran (no visible enabled button): nothing was sent.
+            self._ua_log(steps, "place-order button was not clickable")
+            warnings.append("the place-order button was not clickable; the outcome is treated as unknown")
+            return {"status": "outcome_unknown", "order_id": None}
+        try:
+            return await self._ua_await_outcome(steps, warnings, base, summary, confirm_total_ils)
+        except Exception as e:
+            self._ua_log(steps, f"error after the click: {type(e).__name__}")
+            warnings.append("an error occurred after the place-order click; check the site before ordering again")
+            return {"status": "outcome_unknown", "order_id": None}
+
+    async def _ua_three_ds(self, steps, base, summary, total) -> bool:
+        """Enters the issuer's OTP in the 3-D Secure frame. True if submitted."""
+        from sms_codes import SmsCodeError
+        frame = None
+        deadline = time.monotonic() + config.UNATTENDED_STEP_SECONDS
+        while frame is None and time.monotonic() < deadline:
+            handle = await self.page.query_selector(".creditCardOtpPopup iframe")
+            top = await handle.content_frame() if handle else None
+            for f in ([top] + list(top.child_frames) if top else []):
+                try:
+                    if (await f.evaluate(self.UA_FRAME_OTP_JS)).get("inputs") == 1:
+                        frame = f
+                        break
+                except Exception:
+                    continue
+            if frame is None:
+                await self._ua_sleep()
+        if frame is None:
+            self._ua_log(steps, "3-D Secure: no single code field found in the bank's window")
+            return False
+        self._ua_log(steps, "3-D Secure: waiting for the bank's SMS code")
+        last4 = (summary.get("payment") or {}).get("last4")
+        try:
+            code = await self.sms_reader.wait_for_code("3ds", base, amount=total, last4=last4)
+        except SmsCodeError as e:
+            self._ua_log(steps, f"3-D Secure: {e.code}")
+            return False
+        outcome = await frame.evaluate(self.UA_FRAME_SUBMIT_JS, code)
+        code = None
+        self._ua_log(steps, f"3-D Secure: code entered ({outcome})")
+        return outcome in ("clicked", "submitted")
+
+    async def _ua_await_outcome(self, steps, warnings, base, summary, total) -> Dict[str, Any]:
+        """After the click: handle 3-D Secure once, then read the order number
+        from the real confirmation page only."""
+        deadline = time.monotonic() + config.UNATTENDED_RESULT_SECONDS
+        three_ds_done = False
+        looked_confirmed = False
+        while time.monotonic() < deadline:
+            await self._ua_sleep()
+            if not self._is_alive():
+                warnings.append("the browser closed after the place-order click")
+                return {"status": "outcome_unknown", "order_id": None}
+            url = self.page.url
+            if is_confirmation_url(url):
+                looked_confirmed = True
+                order_id = parse_order_number(url, await self.page.content())
+                if order_id:
+                    self._ua_log(steps, f"confirmation page read: order {order_id}")
+                    return {"status": "placed", "order_id": order_id}
+                continue
+            try:
+                state = await self._ua_state()
+            except Exception:
+                continue  # navigating
+            if state.get("errorPopup"):
+                self._ua_log(steps, "the site showed an error after the click")
+                warnings.append(f"the site showed an error after the place-order click: {state['errorPopup']}")
+                return {"status": "outcome_unknown", "order_id": None}
+            if state.get("threeDS") and not three_ds_done:
+                three_ds_done = True
+                self._ua_log(steps, "3-D Secure challenge shown")
+                if not await self._ua_three_ds(steps, base, summary, total):
+                    warnings.append("the 3-D Secure step could not be completed automatically")
+                    return {"status": "outcome_unknown", "order_id": None}
+        self._ua_log(steps, "no confirmation page in time")
+        warnings.append("no confirmation page was seen after the place-order click; check the site's order list")
+        return {"status": "placed_unconfirmed" if looked_confirmed else "outcome_unknown", "order_id": None}
 
     async def _await_handover(self) -> Dict[str, Any]:
         """Waits for Or to finish payment and click place-order in the visible

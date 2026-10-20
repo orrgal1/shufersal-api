@@ -1,0 +1,261 @@
+"""Unattended checkout (watched=false, SHUFERSAL_LIVE_CHECKOUT_ENABLED and
+SHUFERSAL_UNATTENDED_CHECKOUT on) against the fake site and a fake sms-api."""
+import logging
+
+import pytest
+
+import config
+import main
+from checkout_ledger import CheckoutLedger
+from sms_codes import SmsCodeReader, check_issuer_code
+from tests.test_live_driver import AUTH, _fill, _quote, _real, client, live, make_driver, site  # noqa: F401
+
+
+@pytest.fixture
+def ua(monkeypatch, live, site):
+    monkeypatch.setattr(config, "LIVE_CHECKOUT_ENABLED", True)
+    monkeypatch.setattr(config, "UNATTENDED_CHECKOUT", True)
+    monkeypatch.setattr(config, "SHUFERSAL_CVV", "042")
+    monkeypatch.setattr(config, "MAX_ORDER_ILS", 600.0)
+    for name, value in (("SMS_WAIT_SECONDS", 0.3), ("SMS_POLL_SECONDS", 0), ("UNATTENDED_POLL_SECONDS", 0),
+                        ("UNATTENDED_STEP_SECONDS", 0.5), ("UNATTENDED_RESULT_SECONDS", 0.5)):
+        monkeypatch.setattr(config, name, value)
+    monkeypatch.setattr(config, "THREE_DS_MERCHANT_HINTS", ["shufersal", "שופרסל"])
+    live.sms_reader = SmsCodeReader(fetch=site.sms.fetch)
+    site.checkout_gated = True  # live: /checkout needs the re-auth first
+    _fill(site)
+    return live
+
+
+def _submit(client, q, key, **extra):
+    return client.post("/checkout/submit", json=_real(q, **extra), headers={**AUTH, "Idempotency-Key": key})
+
+
+def _no_secrets(caplog, res, site):
+    text = caplog.text + res.text
+    for secret in (site.login_code, site.issuer_code, "042"):
+        assert secret not in text
+
+
+def test_full_unattended_path_with_3ds(ua, client, site, caplog):
+    caplog.set_level(logging.INFO)
+    site.after_click = "3ds"
+    q = _quote(client)
+    res = _submit(client, q, "ua-1")
+    assert res.status_code == 200, res.text
+    body = res.json()
+    assert body["status"] == "placed" and body["order_id"] == "987654321"
+    assert site.place_clicks == 1 and site.orders_placed == 1
+    assert site.three_ds_codes == [site.issuer_code]
+    assert site.benefit_continue_adds == 0 and len(site.cart) == 2  # popup closed, nothing added
+    assert body["checks"]["site_total_source"] == "checkout"
+    steps = body["checks"]["unattended_steps"]
+    for expected in ("clicked 'מעבר לקופה'", "re-auth: SMS code requested", "reached the checkout page",
+                     "clicking the place-order button (once)", "3-D Secure challenge shown"):
+        assert any(expected in s for s in steps), (expected, steps)
+    assert "unattended checkout:" in caplog.text
+    _no_secrets(caplog, res, site)
+    assert main.checkout_ledger.unresolved() == []
+
+
+def test_unattended_without_3ds_and_with_cvv_and_checkout_popup(ua, client, site, caplog):
+    caplog.set_level(logging.INFO)
+    site.checkout_cvv_field = True
+    site.checkout_popups = ["phoneCheckModal"]
+    q = _quote(client)
+    res = _submit(client, q, "ua-2")
+    assert res.status_code == 200 and res.json()["status"] == "placed", res.text
+    assert site.ui["cvv_value"] == "042"
+    assert site.place_clicks == 1
+    _no_secrets(caplog, res, site)
+
+
+def test_unattended_needs_both_flags(monkeypatch, ua, client, site):
+    monkeypatch.setattr(config, "UNATTENDED_CHECKOUT", False)
+    q = _quote(client)
+    res = _submit(client, q, "ua-3")
+    assert res.status_code == 409 and res.json()["error"]["code"] == "checkout_blocked"
+    assert site.place_clicks == 0 and site.ui["sms_sent"] is False
+    monkeypatch.setattr(config, "UNATTENDED_CHECKOUT", True)
+    monkeypatch.setattr(config, "LIVE_CHECKOUT_ENABLED", False)
+    q = _quote(client)
+    res = _submit(client, q, "ua-4")
+    assert res.status_code == 403 and res.json()["error"]["code"] == "live_checkout_disabled"
+
+
+def test_existing_confirm_key_and_hash_checks_still_apply(ua, client, site):
+    q = _quote(client)
+    res = client.post("/checkout/submit", json=_real(q, confirm=False), headers={**AUTH, "Idempotency-Key": "k"})
+    assert res.json()["error"]["code"] == "confirmation_required"
+    res = client.post("/checkout/submit", json=_real(q), headers=AUTH)
+    assert res.json()["error"]["code"] == "idempotency_key_required"
+    res = _submit(client, q, "ua-5", expected_cart_hash="0" * 16)
+    assert res.json()["error"]["code"] == "cart_mismatch"
+    assert site.place_clicks == 0
+
+
+def test_cart_summary_total_drift_stops_before_anything(ua, client, site):
+    q = _quote(client)
+    site.summary_total_text = "999.99 ₪"
+    res = _submit(client, q, "ua-6")
+    assert res.status_code == 409 and res.json()["error"]["code"] == "total_drift"
+    assert site.ui["sms_sent"] is False and site.place_clicks == 0
+
+
+def test_checkout_page_total_is_reverified(ua, client, site):
+    q = _quote(client)
+    site.checkout_total_delta = 0.05
+    site.summary_total_text = "%.2f ₪" % q["total_ils"]
+    res = _submit(client, q, "ua-7")
+    assert res.status_code == 409 and res.json()["error"]["code"] == "total_drift"
+    assert "checkout page" in res.json()["error"]["message"]
+    assert site.place_clicks == 0
+    assert main.checkout_ledger.unresolved() == []  # nothing was placed: no block
+
+
+def test_cart_change_on_the_way_is_refused(ua, client, site):
+    q = _quote(client)
+    site.cart_change_on_checkout = True
+    res = _submit(client, q, "ua-8")
+    assert res.json()["error"]["code"] == "cart_mismatch" and site.place_clicks == 0
+
+
+def test_order_cap(monkeypatch, ua, client, site):
+    monkeypatch.setattr(config, "MAX_ORDER_ILS", 50.0)
+    q = _quote(client)
+    res = _submit(client, q, "ua-9")
+    assert res.status_code == 409 and res.json()["error"]["code"] == "order_over_cap"
+    assert site.ui["sms_sent"] is False and site.place_clicks == 0
+
+
+def test_default_cap_is_600_and_unattended_off(tmp_path):
+    import os
+    import subprocess
+    import sys
+    env = {k: v for k, v in os.environ.items() if k not in ("SHUFERSAL_MAX_ORDER_ILS", "SHUFERSAL_UNATTENDED_CHECKOUT")}
+    out = subprocess.run([sys.executable, "-c", "import sys; sys.path.insert(0, %r); import config; "
+                          "print(config.MAX_ORDER_ILS, config.UNATTENDED_CHECKOUT)" % os.getcwd()],
+                         cwd=tmp_path, env=env, capture_output=True, text=True)
+    assert out.stdout.split() == ["600.0", "False"], out.stderr
+
+
+@pytest.mark.parametrize("case", ["old", "wrong_sender", "none", "sms_down"])
+def test_login_code_must_be_fresh_and_from_shufersal(ua, client, site, case):
+    if case == "old":
+        site.send_login_sms = False
+        site.sms.add("SHUFERSAL", "קוד האימות שלך: 111111", age_seconds=30)
+    elif case == "wrong_sender":
+        site.login_sms_sender = "Dominos"
+    elif case == "none":
+        site.send_login_sms = False
+    elif case == "sms_down":
+        site.sms.fail = True
+    q = _quote(client)
+    res = _submit(client, q, f"ua-login-{case}")
+    assert res.status_code == 409, res.text
+    expected = "sms_unavailable" if case == "sms_down" else "sms_code_timeout"
+    assert res.json()["error"]["code"] == expected
+    assert site.ui["sms_value"] == "" and site.place_clicks == 0
+    assert main.checkout_ledger.unresolved() == []
+
+
+def test_code_received_before_trigger_is_ignored_even_if_recent(ua, client, site):
+    # Arrived (higher rowid) but stamped before the trigger: not accepted.
+    site.send_login_sms = False
+    site.sms.add("SHUFERSAL", "קוד: 222222", age_seconds=20)
+    q = _quote(client)
+    res = _submit(client, q, "ua-10")
+    assert res.json()["error"]["code"] == "sms_code_timeout"
+
+
+def test_wrong_login_code_is_a_clean_failure(ua, client, site):
+    site.login_sms_text = "קוד: 000000"
+    q = _quote(client)
+    res = _submit(client, q, "ua-11")
+    assert res.status_code == 409 and res.json()["error"]["code"] == "reauth_failed"
+    assert site.place_clicks == 0
+
+
+@pytest.mark.parametrize("field,value", [("issuer_sender", "Cal"), ("issuer_amount", 1.0),
+                                         ("issuer_last4", "9999"), ("issuer_merchant", "BugMultisystem"),
+                                         ("send_issuer_sms", False)])
+def test_3ds_code_guardrails_make_the_outcome_unknown_and_block(ua, client, site, field, value):
+    site.after_click = "3ds"
+    setattr(site, field, value)
+    q = _quote(client)
+    res = _submit(client, q, f"ua-3ds-{field}")
+    assert res.status_code == 202 and res.json()["status"] == "outcome_unknown", res.text
+    assert site.three_ds_codes == [] and site.place_clicks == 1
+    assert [u["idempotency_key"] for u in main.checkout_ledger.unresolved()] == [f"ua-3ds-{field}"]
+    # Any further order is blocked until Or resolves it.
+    site.after_click = "confirm"
+    q2 = _quote(client)
+    blocked = _submit(client, q2, "ua-next")
+    assert blocked.status_code == 409 and blocked.json()["error"]["code"] == "order_outcome_unresolved"
+    assert site.place_clicks == 1
+    assert main.checkout_ledger.resolve(f"ua-3ds-{field}", "not_placed")
+    ok = _submit(client, _quote(client), "ua-after-resolve")
+    assert ok.status_code == 200 and ok.json()["status"] == "placed"
+
+
+@pytest.mark.parametrize("after,status", [("error", "outcome_unknown"), ("nothing", "outcome_unknown"),
+                                          ("confirm_no_number", "placed_unconfirmed")])
+def test_ambiguous_outcomes_after_the_click(ua, client, site, after, status):
+    site.after_click = after
+    q = _quote(client)
+    res = _submit(client, q, f"ua-amb-{after}")
+    assert res.status_code == 202 and res.json()["status"] == status and res.json()["order_id"] is None
+    assert site.place_clicks == 1
+    assert main.checkout_ledger.unresolved()[0]["state"] == status
+    # Replaying the same key returns the stored result and never clicks again.
+    again = _submit(client, q, f"ua-amb-{after}")
+    assert again.json() == res.json() and site.place_clicks == 1
+
+
+def test_crash_after_click_leaves_a_blocking_placing_record(ua, client, site, monkeypatch):
+    async def boom(*a, **k):
+        raise RuntimeError("process died")
+    monkeypatch.setattr(ua, "_ua_await_outcome", boom)
+    q = _quote(client)
+    res = _submit(client, q, "ua-12")
+    assert res.json()["status"] == "outcome_unknown" and site.place_clicks == 1
+    assert main.checkout_ledger.unresolved()[0]["idempotency_key"] == "ua-12"
+
+
+def test_placing_state_blocks_even_without_finish(tmp_path):
+    ledger = CheckoutLedger(str(tmp_path / "l.sqlite3"))
+    assert ledger.claim("a", "q1") is None
+    ledger.mark("a", "placing")  # the process died right after the click
+    again = CheckoutLedger(str(tmp_path / "l.sqlite3"))
+    assert again.claim("b", "q2")["state"] == "blocked_unresolved"
+    assert again.resolve("a", "placed")
+    assert again.claim("b", "q2") is None
+
+
+def test_ambiguous_3ds_frame_is_not_guessed(ua, client, site):
+    site.after_click = "3ds"
+    site.three_ds_inputs = 2
+    q = _quote(client)
+    res = _submit(client, q, "ua-13")
+    assert res.json()["status"] == "outcome_unknown" and site.three_ds_codes == []
+
+
+def test_watched_mode_still_hands_over(ua, client, site, monkeypatch):
+    monkeypatch.setattr(config, "HEADLESS", True)
+    monkeypatch.setattr(config, "WATCH_POLL_SECONDS", 0)
+    monkeypatch.setattr(config, "WATCH_TIMEOUT_SECONDS", 5)
+    site.checkout_gated = True
+    site.confirm_on_url_reads = 2
+    q = _quote(client)
+    res = _submit(client, q, "ua-w", watched=True)
+    assert res.status_code == 200 and res.json()["status"] == "placed"
+    assert site.place_clicks == 0 and site.ui["sms_sent"] is False  # Or did it
+
+
+def test_issuer_text_parsing_matches_real_format():
+    text = ("חשוב מאוד, לתשומת ליבך-\nזיהינו כעת עסקה בסכום 447.06 ILS ב שופרסל אונליין בכרטיסך 8277,\n"
+            "הקוד שלך להשלמת העסקה הינו 123456\nתמיד לשירותך, ישראכרט\n\n"
+            "Код для завершения оплаты 123456.")
+    assert check_issuer_code(text, 447.06, "8277") == {"ok": True, "code": "123456"}
+    assert not check_issuer_code(text, 447.00, "8277")["ok"]
+    assert not check_issuer_code(text, 447.06, "1111")["ok"]
