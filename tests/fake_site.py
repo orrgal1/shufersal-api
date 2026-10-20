@@ -43,6 +43,10 @@ PAYMENT_INFOS = [
 ]
 
 
+ADULT_REQUIREMENT = ('אופן קבלת המשלוח קבלת משלוח המכיל אלכוהול, סיגריות, טבק או תרופות, '
+                     'תתאפשר רק ע"י אדם בגיל 18 ומעלה')
+
+
 class FakeSite:
     def __init__(self):
         self.cart = []  # [{"entry": int, "code": str, "qty": float}]
@@ -143,6 +147,15 @@ class FakeSite:
         self.credit_notice_clicks = 0
         self.events = []                   # ordered log: cost_summary, credit_notice_dismissed, place_click
         self.screenshots = 0
+        # The age-confirmation checkbox (live 2026-10-20 09:22, cart with ouzo):
+        # None = not shown | "unchecked" | "checked". While unchecked, the
+        # place-order click is stopped by the site's own form validation
+        # (red .over-18.errorForm box) and nothing is sent.
+        self.adult_box = None
+        self.adult_ticks = 0
+        self.adult_tick_works = True       # False: the click does not tick it
+        self.adult_ambiguous = False       # two visible boxes with the label
+        self.requirements_before_click = []  # visible validation errors before the click
 
     def expire_session(self):
         """The server forgets the session (idle timeout); takes effect on the next request."""
@@ -436,6 +449,9 @@ class FakeSite:
             self.place_clicks += 1
             self.events.append("place_click")
             mode = self.after_click
+            if self.adult_box == "unchecked" or mode == "validation":
+                ui["requirements"] = [ADULT_REQUIREMENT]  # the site's validation: nothing sent
+                return True
             answers = {"confirm": {"success": True, "redirect": "/checkout/orderConfirmation/987654321"},
                        "confirm_no_number": {"success": True, "redirect": "/checkout/orderConfirmation"},
                        "accepted_no_nav": {"success": True, "redirect": "/checkout/orderConfirmation/987654321"},
@@ -482,6 +498,28 @@ class FakeSite:
                         f"בכרטיסך {self.issuer_last4}, הקוד שלך להשלמת העסקה הינו {self.issuer_code}"))
             return True
         return False
+
+    def adult_eval(self, page, tick):
+        on_checkout = urlparse(page._url).path.rstrip("/").endswith("/miglog-checkout")
+        if not on_checkout or self.adult_box is None:
+            return {"present": False}
+        if self.adult_ambiguous:
+            return {"present": True, "ambiguous": True, "count": 2, "checked": False}
+        out = {"present": True, "count": 1, "checked": self.adult_box == "checked",
+               "error": bool(self.ui.get("requirements")), "text": ADULT_REQUIREMENT}
+        if tick and self.adult_box != "checked":
+            self.adult_ticks += 1
+            self.events.append("adult_tick")
+            if self.adult_tick_works:
+                self.adult_box = "checked"
+                self.ui["requirements"] = []
+            out["clicked"] = True
+        return out
+
+    def requirements(self, page):
+        if not urlparse(page._url).path.rstrip("/").endswith("/miglog-checkout"):
+            return []
+        return list(self.ui.get("requirements") or []) + list(self.requirements_before_click)
 
     def post_state(self, page):
         ui = self.ui
@@ -678,6 +716,10 @@ class FakePage:
             return self.site.missing_popup()
         if "/*ua-popup-text*/" in script:
             return [{"popup": p, "text": f"text of {p}"} for p in self.site.ui["checkout_popups"]]
+        if "/*ua-adult*/" in script:
+            return self.site.adult_eval(self, bool(args))
+        if "/*ua-requirements*/" in script:
+            return self.site.requirements(self)
         if "/*ua-close-benefit*/" in script:
             return self.site.ui_close_benefit(self)
         if args is None and "miglog-cart-summary-totalprice" in script:

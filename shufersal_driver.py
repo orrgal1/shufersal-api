@@ -1040,6 +1040,7 @@ class ShufersalDriver:
         place_order: bool,
         watched: bool = False,
         unattended: bool = False,
+        adult_recipient_confirmed: bool = False,
         on_place_order=None,
     ) -> Dict[str, Any]:
         async with self._guard():
@@ -1055,7 +1056,8 @@ class ShufersalDriver:
                         raise APIException(status_code=503, code="browser_unavailable",
                                            message="Could not open a visible browser window for the watched checkout.")
                 return await self._checkout_unlocked(slot_id, expected_cart_hash, confirm_total_ils, place_order, watched,
-                                                     unattended=unattended, on_place_order=on_place_order)
+                                                     unattended=unattended, on_place_order=on_place_order,
+                                                     adult_recipient_confirmed=adult_recipient_confirmed)
             finally:
                 try:
                     if relaunched:
@@ -1067,7 +1069,7 @@ class ShufersalDriver:
         return await self.page.evaluate(self.CHECKOUT_STATE_JS)
 
     async def _checkout_unlocked(self, slot_id, expected_cart_hash, confirm_total_ils, place_order, watched,
-                                 unattended=False, on_place_order=None):
+                                 unattended=False, on_place_order=None, adult_recipient_confirmed=False):
         """Walks checkout: verify cart -> select slot -> open the cart summary and
         read the site total -> try the checkout page, then
           - place_order=False: stop (dry run);
@@ -1207,7 +1209,8 @@ class ShufersalDriver:
         if watched:
             return dict(result, **(await self._await_handover()))
         if unattended:
-            return dict(result, **(await self._unattended_place(summary, confirm_total_ils, result, on_place_order)))
+            return dict(result, **(await self._unattended_place(summary, confirm_total_ils, result, on_place_order,
+                                                                adult_recipient_confirmed=adult_recipient_confirmed)))
 
         if on_place_order:
             on_place_order()  # atomic ledger re-check + "placing" mark; raises -> no request sent
@@ -1412,6 +1415,67 @@ class ShufersalDriver:
         if (!/^[\\s,.:!\\-–]*$/.test(rest)) return {ok: false, why: 'text'};
         if (click) b.click();
         return {ok: true};
+    }"""
+    # The checkout's age-confirmation block (live 2026-10-20 09:22, section 4
+    # "העדפות משלוח", shown when the cart holds alcohol, tobacco or medicine):
+    #   <fieldset class="over-18 errorForm"><div class="subTitleContainer"><legend class="topTitle">
+    #   <img src=".../icon-over18-error.png"> אופן קבלת המשלוח</legend> <span>קבלת משלוח המכיל
+    #   אלכוהול, סיגריות, טבק או תרופות, תתאפשר רק ע"י אדם בגיל 18 ומעלה</span></div>
+    #   <div class="radioContainer v2 row space"><label for="true" aria-labelledby="אופן קבלת המשלוח"
+    #   class="btn col-xs-6"><div class="checkboxContainer"><label class="btn activeCheckbox">
+    #   <span class="checkboxPic"></span></label></div> <strong id="over18text" class="radioText">
+    #   יהיה בבית אדם בגיל 18 ומעלה לקבל את המשלוח</strong></label></div></fieldset>
+    # There is no <input>: the site's CSS (stylem8e8d1.css) draws the tick for
+    # ".over-18 .radioContainer .btn.active ... .checkboxPic:after", so "checked"
+    # is the class "active" on the label that holds the text, and ".over-18.errorForm"
+    # is the red required-field box. The box is found by its exact label text
+    # (never by position); with tick=true and the box unchecked, its own square
+    # (.checkboxContainer .activeCheckbox inside that label) is clicked once.
+    ADULT_LABEL = "יהיה בבית אדם בגיל 18 ומעלה לקבל את המשלוח"
+    UA_ADULT_JS = """(tick) => { /*ua-adult*/
+        const vis = (e) => !!e && e.getClientRects().length > 0 && getComputedStyle(e).visibility !== 'hidden';
+        const norm = (t) => (t || '').replace(/\\s+/g, ' ').trim();
+        const LABEL = 'יהיה בבית אדם בגיל 18 ומעלה לקבל את המשלוח';
+        const hits = [...document.querySelectorAll('body *')].filter(e => norm(e.textContent) === LABEL
+            && ![...e.children].some(c => norm(c.textContent) === LABEL));
+        const labels = [...new Set(hits.map(e => e.closest('label')).filter(Boolean))].filter(vis);
+        if (labels.length === 0) return {present: false};
+        if (labels.length > 1) return {present: true, ambiguous: true, count: labels.length, checked: false};
+        const label = labels[0];
+        const input = label.querySelector('input[type=checkbox]');
+        const aria = label.getAttribute('aria-checked') || (label.querySelector('[aria-checked]') || {getAttribute: () => null}).getAttribute('aria-checked');
+        const checked = input ? !!input.checked : (aria ? aria === 'true' : label.classList.contains('active'));
+        const box = label.closest('.over-18') || label.closest('fieldset');
+        const out = {present: true, count: 1, checked, error: !!(box && box.classList.contains('errorForm')),
+                     text: box ? norm(box.querySelector('.subTitleContainer') ? box.querySelector('.subTitleContainer').innerText : '').slice(0, 300) : ''};
+        if (tick && !checked) {
+            const target = input || label.querySelector('.checkboxContainer .activeCheckbox') || label;
+            target.click();
+            out.clicked = true;
+        }
+        return out;
+    }"""
+    # Visible required-field / validation errors on the checkout page: the red
+    # ".errorForm" box (live 2026-10-20) and, from the checkout bundle,
+    # [role=alert].colorError, .whiteErrorBg .error and .error-text. Hidden
+    # elements and empty error containers are ignored.
+    UA_REQUIREMENTS_JS = """() => { /*ua-requirements*/
+        const vis = (e) => !!e && e.getClientRects().length > 0 && getComputedStyle(e).visibility !== 'hidden';
+        const norm = (t) => (t || '').replace(/\\s+/g, ' ').trim();
+        const out = [];
+        for (const e of document.querySelectorAll('.errorForm, [role=alert].colorError, .whiteErrorBg .error, .error-text')) {
+            if (!vis(e) || e.closest('#forgottenPwdModal')) continue;
+            let t = '';
+            if (e.classList.contains('errorForm')) {
+                const head = e.querySelector('.subTitleContainer, legend');
+                t = norm(head ? head.innerText : e.innerText);
+                if (!t) t = 'a required field is marked (' + String(e.className).slice(0, 60) + ')';
+            } else {
+                t = norm(e.innerText);
+            }
+            if (t && !out.includes(t.slice(0, 300))) out.push(t.slice(0, 300));
+        }
+        return out.slice(0, 6);
     }"""
     # The visible popups' own text, for the error when a run stops on one.
     UA_POPUP_TEXT_JS = """() => { /*ua-popup-text*/
@@ -1644,7 +1708,63 @@ class ShufersalDriver:
                                 f"The checkout page's delivery slot ({got or 'unreadable'}) is not the quoted slot ({want}).")
         self._ua_log(steps, f"delivery slot verified ({got})")
 
-    async def _unattended_place(self, summary, confirm_total_ils, result, on_place_order) -> Dict[str, Any]:
+    async def _ua_requirements(self) -> List[str]:
+        try:
+            return [str(t) for t in (await self.page.evaluate(self.UA_REQUIREMENTS_JS) or []) if t]
+        except Exception:
+            return []
+
+    async def _ua_adult_recipient(self, steps: List[str], confirmed: bool):
+        """The age-confirmation checkbox (see UA_ADULT_JS): ticked once when Or
+        confirmed an adult will be home; otherwise stop before the click."""
+        state = await self.page.evaluate(self.UA_ADULT_JS, False) or {}
+        if not state.get("present") or state.get("checked"):
+            return
+        if state.get("ambiguous"):
+            raise self._ua_fail(steps, "checkout_requirement",
+                                f"The checkout page shows {state.get('count')} age-confirmation checkboxes; none was ticked.")
+        if not confirmed:
+            raise self._ua_fail(
+                steps, "adult_recipient_required",
+                "The cart holds alcohol, cigarettes, tobacco or medicine, and the checkout requires confirming that "
+                f"an adult 18+ will be home to receive the delivery (\"{self.ADULT_LABEL}\"). Confirm with Or that an "
+                "adult will be home, then submit again with adult_recipient_confirmed=true. No order was placed.",
+                details={"requirement": state.get("text") or None, "checkbox_label": self.ADULT_LABEL})
+        done = await self.page.evaluate(self.UA_ADULT_JS, True) or {}
+        if not done.get("clicked") and not done.get("checked"):
+            raise self._ua_fail(steps, "checkout_requirement", "The age-confirmation checkbox could not be ticked.")
+        self._ua_log(steps, f"ticked the age-confirmation checkbox \"{self.ADULT_LABEL}\" "
+                            "(adult_recipient_confirmed=true)")
+        deadline = time.monotonic() + config.UNATTENDED_STEP_SECONDS
+        while True:
+            await self._ua_sleep()
+            now = await self.page.evaluate(self.UA_ADULT_JS, False) or {}
+            if now.get("checked"):
+                break
+            if time.monotonic() > deadline:
+                raise self._ua_fail(steps, "checkout_requirement",
+                                    "The age-confirmation checkbox did not show as ticked after one click; "
+                                    "it was not clicked again.")
+        self._ua_log(steps, "age-confirmation checkbox verified as ticked")
+
+    async def _ua_requirement_guard(self, steps: List[str], confirmed: bool):
+        """Right before the click: an unticked age box or any visible
+        required-field error stops the run (the site would not send the order)."""
+        adult = await self.page.evaluate(self.UA_ADULT_JS, False) or {}
+        if adult.get("present") and not adult.get("checked"):
+            if not confirmed:
+                await self._ua_adult_recipient(steps, confirmed)
+            raise self._ua_fail(steps, "checkout_requirement",
+                                "The age-confirmation checkbox is not ticked right before the place-order click.")
+        errors = await self._ua_requirements()
+        if errors:
+            raise self._ua_fail(steps, "checkout_requirement",
+                                "The checkout page shows a required field that is not filled: " + "; ".join(errors)
+                                + ". The place-order button was not clicked.",
+                                details={"requirements": errors})
+
+    async def _unattended_place(self, summary, confirm_total_ils, result, on_place_order,
+                                adult_recipient_confirmed: bool = False) -> Dict[str, Any]:
         from sms_codes import SmsCodeError
         steps: List[str] = []
         result["checks"]["unattended_steps"] = steps
@@ -1678,6 +1798,7 @@ class ShufersalDriver:
                 if time.monotonic() > deadline:
                     raise self._ua_fail(steps, "checkout_blocked", "The checkout page's place-order button did not appear.")
                 await self._ua_sleep()
+            await self._ua_adult_recipient(steps, adult_recipient_confirmed)
             # The checks below run again after a popup dismissed at their end.
             while True:
                 # Re-verify on the checkout page itself: the cart and the site's own total.
@@ -1732,6 +1853,7 @@ class ShufersalDriver:
                     raise self._ua_fail(steps, "checkout_not_configured", "The checkout asks for the CVV but SHUFERSAL_CVV is not set.")
                 await self.page.evaluate(self.UA_FILL_JS, [state["cvvSelector"], cvv])
                 self._ua_log(steps, "entered the saved card's CVV")
+            await self._ua_requirement_guard(steps, adult_recipient_confirmed)
             base = await self.sms_reader.baseline()
         except APIException:
             raise
@@ -1778,11 +1900,19 @@ class ShufersalDriver:
             except Exception as e:
                 self._ua_log(steps, f"error after the click: {type(e).__name__}")
                 warnings.append("an error occurred after the place-order click; check the site before ordering again")
-            return outcome
+            if outcome.get("status") != "not_sent":
+                return outcome
         finally:
             monitor.detach()
             if outcome.get("status") != "placed" and not getattr(monitor, "diag_saved", False):
                 await self._ua_diag(steps, outcome.get("status") or "unknown", monitor)
+        # The site's own validation stopped the click and nothing was sent.
+        errors = outcome.get("requirements") or []
+        raise APIException(
+            status_code=409, code="checkout_requirement",
+            message="The site's checkout form blocked the place-order click (no order request was sent, no order "
+                    "was placed): " + "; ".join(errors),
+            details={"requirements": errors, "place_order_sent": False})
 
     async def _ua_post_state(self) -> Dict[str, Any]:
         try:
@@ -1965,6 +2095,17 @@ class ShufersalDriver:
                                 + (f": {'; '.join(shown)[:300]}" if shown else "")
                                 + "; the order was most likely not placed, check the site's order list")
                 return unknown
+            if (monitor is not None and monitor.place_order_requests == 0 and not monitor.in_flight()
+                    and not post.get("spinner") and not pending and not three_ds_done
+                    and self._on_checkout_page(state.get("path"))
+                    and time.monotonic() - start >= min(15.0, config.UNATTENDED_RESULT_SECONDS / 2)):
+                # Certain nothing went out: no placeOrder request in ~15 s, no spinner,
+                # no bank window, still on the checkout page, and a required field shown.
+                errors = await self._ua_requirements()
+                if errors and monitor.place_order_requests == 0:
+                    self._ua_log(steps, "the site's form validation blocked the click; no place-order request was "
+                                        "sent: " + "; ".join(errors)[:200])
+                    return {"status": "not_sent", "order_id": None, "requirements": errors}
             if (shown and monitor and monitor.place_order_requests == 0 and not post.get("spinner")
                     and not pending and time.monotonic() - start >= grace):
                 self._ua_log(steps, "the site showed a message and sent no place-order request")

@@ -44,7 +44,8 @@ SAFE_CHECKOUT_CODES = {
     "live_checkout_disabled", "order_rejected", "checkout_not_configured", "browser_unavailable",
     "slot_select_failed", "checkout_unreachable", "quote_consumed", "cart_incomplete", "checkout_in_progress", "payment_method_unavailable", "invalid_input",
     "order_over_cap", "order_outcome_unresolved", "reauth_failed", "sms_unavailable", "sms_code_timeout",
-    "sms_code_ambiguous", "products_unavailable", "attempt_interrupted",
+    "sms_code_ambiguous", "products_unavailable", "attempt_interrupted", "adult_recipient_required",
+    "checkout_requirement",
 }
 # Idempotency-Keys whose order attempt is running in THIS process right now. A
 # same-key request (e.g. a gateway retry on a slow answer) gets 202 in_progress.
@@ -456,6 +457,7 @@ async def _run_submit(payload, quote, expected_hash, place_order, unattended, id
             place_order=place_order,
             watched=payload.watched,
             unattended=unattended,
+            adult_recipient_confirmed=payload.adult_recipient_confirmed,
             on_place_order=(lambda: _begin_placing(idempotency_key)) if place_order else None,
         )
     except APIException as exc:

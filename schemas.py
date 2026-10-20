@@ -174,6 +174,13 @@ class CheckoutSubmitRequest(BaseModel):
     # password/SMS, card and 3-D Secure step and clicks place-order himself; the
     # service returns the order number from the confirmation page.
     watched: bool = False
+    # Or has confirmed an adult 18+ will be home to receive the delivery. Needed
+    # (unattended runs) when the cart holds alcohol, tobacco or medicine: the
+    # checkout then shows a required "יהיה בבית אדם בגיל 18 ומעלה לקבל את המשלוח"
+    # checkbox, which the service ticks only with this flag (else 409
+    # adult_recipient_required, before any place-order click).
+    adult_recipient_confirmed: bool = Field(
+        False, description="Or has confirmed an adult 18+ will be home to receive the delivery.")
 
     @model_validator(mode="after")
     def require_expectation(self):
