@@ -16,3 +16,12 @@ def fresh_checkout_ledger(monkeypatch):
     ledger = CheckoutLedger(":memory:")
     monkeypatch.setattr(main, "checkout_ledger", ledger)
     return ledger
+
+
+@pytest.fixture(autouse=True)
+def diag_dir(monkeypatch, tmp_path):
+    """Post-click diagnostics go to a per-test directory, never the working tree."""
+    import config
+    path = tmp_path / "diag"
+    monkeypatch.setattr(config, "DIAG_DIR", str(path))
+    return path

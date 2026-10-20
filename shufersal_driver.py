@@ -9,6 +9,7 @@ import json
 
 import config
 from security import APIException
+from checkout_diag import PostClickMonitor, save_diagnostics
 from shufersal_parsers import (
     ParseError,
     cart_count_check,
@@ -1263,6 +1264,33 @@ class ShufersalDriver:
     #     a 3-D Secure answer opens .creditCardOtpPopup with an <iframe> of the
     #     bank's page; on success the site calls placeOrder again (after3ds=true)
     #     and navigates to the confirmation page; errors open .generalErrorChat.
+    #   * after the click (checkout bundle checkoutm8e8d1.js, read 2026-10-20):
+    #     AppRoot.placeOrder is a no-op while the store isLoading or the button
+    #     is disabled; client validation failures render inline
+    #     ([role=alert].colorError, .whiteErrorBg .error) or as toastr toasts
+    #     (#toast-container) and send nothing; otherwise .spinner-container gets
+    #     .active, PayMe.clientData() builds the jwt, GET placeOrder is sent and
+    #     its answer is: success -> location = redirect; allocationTimeout ->
+    #     .generalErrorChat; a 3DS link -> .creditCardOtpPopup iframe (the bank
+    #     page decides SMS code vs approval in the issuer's app; success writes
+    #     sessionStorage, the site re-sends placeOrder with after3ds=true);
+    #     an error array -> inline / toast errors. The site opens no window
+    #     (no window.open in the bundle); popups are still watched for.
+    UA_POST_STATE_JS = """() => { /*ua-post*/
+        const vis = (e) => !!e && e.getClientRects().length > 0 && getComputedStyle(e).visibility !== 'hidden';
+        const txt = (e) => (e.innerText || e.textContent || '').replace(/\\s+/g, ' ').trim().slice(0, 200);
+        const uniq = (a) => [...new Set(a.filter(Boolean))].slice(0, 6);
+        const toasts = uniq([...document.querySelectorAll('#toast-container .toast, .toast-error, .toast-warning')].filter(vis).map(txt));
+        const alerts = uniq([...document.querySelectorAll('[role=alert], .colorError, .whiteErrorBg .error, .otpError')]
+            .filter(e => vis(e) && !e.closest('#forgottenPwdModal')).map(txt));
+        const modals = [...document.querySelectorAll('.modal')].filter(m => vis(m) && !m.classList.contains('modalFromSide'))
+            .map(m => ({popup: m.id || String(m.className).slice(0, 60), text: txt(m)}));
+        const strip = (v) => { try { const u = new URL(v, location.href); return u.origin + u.pathname; } catch (x) { return ''; } };
+        const iframes = [...document.querySelectorAll('iframe')].filter(vis).map(f => strip(f.getAttribute('src') || '')).slice(0, 8);
+        const spin = document.querySelector('.spinner-container');
+        return {toasts, alerts, modals, iframes, spinner: !!spin && spin.classList.contains('active'),
+                threeDS: vis(document.querySelector('.creditCardOtpPopup'))};
+    }"""
     UA_STATE_JS = """() => { /*ua-state*/
         const vis = (e) => !!e && e.getClientRects().length > 0 && getComputedStyle(e).visibility !== 'hidden';
         const q = (s) => document.querySelector(s);
@@ -1393,11 +1421,14 @@ class ShufersalDriver:
                         text: (m.innerText || '').replace(/\\s+/g, ' ').trim().slice(0, 300)}));
     }"""
     # Inside the bank's 3-D Secure frame: the single visible code input.
+    # appWait: the bank page asks to approve in the issuer's app (no code field).
     UA_FRAME_OTP_JS = """() => { /*ua-3ds-probe*/
         const vis = (e) => !!e && e.getClientRects().length > 0 && getComputedStyle(e).visibility !== 'hidden';
         const inputs = [...document.querySelectorAll('input')].filter(e => vis(e) && !e.disabled
             && ['text', 'tel', 'password', 'number', ''].includes((e.getAttribute('type') || '').toLowerCase()));
-        return {inputs: inputs.length};
+        const text = ((document.body && document.body.innerText) || '').replace(/\\s+/g, ' ').trim();
+        const appWait = /אפליקצי|באפליקציה|ממתין לאישור|ממתינים לאישור|אשר.{0,20}(בטלפון|בנייד)|push|app/i.test(text);
+        return {inputs: inputs.length, appWait: inputs.length === 0 && appWait, text: text.slice(0, 160)};
     }"""
     UA_FRAME_SUBMIT_JS = """(code) => { /*ua-3ds-submit*/
         const vis = (e) => !!e && e.getClientRects().length > 0 && getComputedStyle(e).visibility !== 'hidden';
@@ -1719,66 +1750,181 @@ class ShufersalDriver:
                 self._ua_log(steps, f"stopped before placing the order: {e.code}")
                 raise
         self._ua_log(steps, "clicking the place-order button (once)")
-        try:
-            clicked = await self.page.evaluate(self.UA_CLICK_JS, "a.btnConfirm")
-        except Exception:
-            clicked = None
-        if clicked is False:
-            # The click handler never ran (no visible enabled button): nothing was sent.
-            self._ua_log(steps, "place-order button was not clickable")
-            warnings.append("the place-order button was not clickable; the outcome is treated as unknown")
-            return {"status": "outcome_unknown", "order_id": None}
-        try:
-            return await self._ua_await_outcome(steps, warnings, base, summary, confirm_total_ils)
-        except Exception as e:
-            self._ua_log(steps, f"error after the click: {type(e).__name__}")
-            warnings.append("an error occurred after the place-order click; check the site before ordering again")
-            return {"status": "outcome_unknown", "order_id": None}
+        before = await self._ua_post_state()
+        noted = [0]
 
-    async def _ua_three_ds(self, steps, base, summary, total) -> bool:
-        """Enters the issuer's OTP in the 3-D Secure frame. True if submitted."""
-        from sms_codes import SmsCodeError
-        frame = None
-        deadline = time.monotonic() + config.UNATTENDED_STEP_SECONDS
-        while frame is None and time.monotonic() < deadline:
+        def note(line: str):
+            # Every post-click event goes to the log; the first 40 also to the steps.
+            logger.info(f"unattended checkout: {line}")
+            if noted[0] < 40:
+                steps.append(line)
+            noted[0] += 1
+
+        monitor = PostClickMonitor(self.page, self.context, note)
+        monitor.attach()
+        outcome: Dict[str, Any] = {"status": "outcome_unknown", "order_id": None}
+        try:
+            try:
+                clicked = await self.page.evaluate(self.UA_CLICK_JS, "a.btnConfirm")
+            except Exception:
+                clicked = None
+            if clicked is False:
+                # The click handler never ran (no visible enabled button): nothing was sent.
+                self._ua_log(steps, "place-order button was not clickable")
+                warnings.append("the place-order button was not clickable; the outcome is treated as unknown")
+                return outcome
+            try:
+                outcome = await self._ua_await_outcome(steps, warnings, base, summary, confirm_total_ils, monitor, before)
+            except Exception as e:
+                self._ua_log(steps, f"error after the click: {type(e).__name__}")
+                warnings.append("an error occurred after the place-order click; check the site before ordering again")
+            return outcome
+        finally:
+            monitor.detach()
+            if outcome.get("status") != "placed" and not getattr(monitor, "diag_saved", False):
+                await self._ua_diag(steps, outcome.get("status") or "unknown", monitor)
+
+    async def _ua_post_state(self) -> Dict[str, Any]:
+        try:
+            return await self.page.evaluate(self.UA_POST_STATE_JS) or {}
+        except Exception:
+            return {}
+
+    async def _ua_diag(self, steps, tag: str, monitor=None, extra=None):
+        """Masked screenshot + sanitized DOM + post-click events to config.DIAG_DIR."""
+        try:
+            prefix = await save_diagnostics(self.page, tag, monitor, extra)
+        except Exception as e:
+            prefix = None
+            logger.info(f"unattended checkout: diagnostics failed ({type(e).__name__})")
+        if monitor is not None:
+            monitor.diag_saved = True
+        if prefix:
+            self._ua_log(steps, f"diagnostics saved to {prefix}.*")
+        return prefix
+
+    async def _ua_three_ds_frames(self, monitor=None) -> List[Any]:
+        """Candidate bank frames: the .creditCardOtpPopup iframe (and its child
+        frames), and every frame of any window opened after the click."""
+        frames: List[Any] = []
+        try:
             handle = await self.page.query_selector(".creditCardOtpPopup iframe")
             top = await handle.content_frame() if handle else None
-            for f in ([top] + list(top.child_frames) if top else []):
+        except Exception:
+            top = None
+        if top is not None:
+            frames += [top] + list(getattr(top, "child_frames", []) or [])
+        for popup in (monitor.popups if monitor else []):
+            try:
+                if not popup.is_closed():
+                    frames += list(popup.frames)
+            except Exception:
+                continue
+        return frames
+
+    def _payment_window_open(self, state: Dict[str, Any], monitor=None) -> bool:
+        if state.get("threeDS"):
+            return True
+        for popup in (monitor.popups if monitor else []):
+            try:
+                if not popup.is_closed():
+                    return True
+            except Exception:
+                continue
+        return False
+
+    async def _ua_three_ds(self, steps, base, summary, total, monitor=None) -> str:
+        """The bank's 3-D Secure step. Enters the issuer's SMS code in the single
+        code field: "submitted"; the bank asks for approval in its app (no code
+        field, app wording on 3 probes): "app_wait"; anything else: "failed"."""
+        from sms_codes import SmsCodeError
+        frame = None
+        app_probes = 0
+        deadline = time.monotonic() + config.UNATTENDED_STEP_SECONDS
+        while frame is None and time.monotonic() < deadline:
+            app_seen = False
+            for f in await self._ua_three_ds_frames(monitor):
                 try:
-                    if (await f.evaluate(self.UA_FRAME_OTP_JS)).get("inputs") == 1:
-                        frame = f
-                        break
+                    probe = await f.evaluate(self.UA_FRAME_OTP_JS)
                 except Exception:
                     continue
-            if frame is None:
-                await self._ua_sleep()
+                if probe.get("inputs") == 1:
+                    frame = f
+                    break
+                app_seen = app_seen or bool(probe.get("appWait"))
+            if frame is not None:
+                break
+            app_probes = app_probes + 1 if app_seen else 0
+            if app_probes >= 3:
+                self._ua_log(steps, "3-D Secure: the bank asks to approve the payment in its app; waiting for the site")
+                return "app_wait"
+            await self._ua_sleep()
         if frame is None:
             self._ua_log(steps, "3-D Secure: no single code field found in the bank's window")
-            return False
+            return "failed"
         self._ua_log(steps, "3-D Secure: waiting for the bank's SMS code")
         last4 = (summary.get("payment") or {}).get("last4")
         try:
             code = await self.sms_reader.wait_for_code("3ds", base, amount=total, last4=last4)
         except SmsCodeError as e:
             self._ua_log(steps, f"3-D Secure: {e.code}")
-            return False
+            return "failed"
         outcome = await frame.evaluate(self.UA_FRAME_SUBMIT_JS, code)
         code = None
         self._ua_log(steps, f"3-D Secure: code entered ({outcome})")
-        return outcome == "clicked"
+        return "submitted" if outcome == "clicked" else "failed"
 
-    async def _ua_await_outcome(self, steps, warnings, base, summary, total) -> Dict[str, Any]:
-        """After the click: handle 3-D Secure once, then read the order number
-        from the real confirmation page only."""
-        deadline = time.monotonic() + config.UNATTENDED_RESULT_SECONDS
+    async def _ua_abandon_payment(self, steps, warnings, monitor, why: str):
+        """A bank approval is still open while the run gives up. Leaving the
+        checkout page (GET of the cart summary; closing any bank window) drops
+        the page's 3-D Secure listener, so a late approval cannot make the site
+        re-send placeOrder. Never clicks anything on the page."""
+        if monitor is not None and monitor.in_flight():
+            # A placeOrder request is on the wire: let it settle before leaving.
+            settle = time.monotonic() + config.UNATTENDED_STEP_SECONDS
+            while monitor.in_flight() and time.monotonic() < settle:
+                await self._ua_sleep()
+        for popup in (monitor.popups if monitor else []):
+            try:
+                if not popup.is_closed():
+                    await popup.close()
+            except Exception:
+                pass
+        try:
+            await self.page.goto(config.SHUFERSAL_BASE_URL + BASE + "/cart/cartsummary",
+                                 wait_until="domcontentloaded", timeout=45000)
+            left = True
+        except Exception:
+            left = False
+        self._ua_log(steps, f"{why}; left the checkout page so a late bank approval cannot place the order"
+                     + ("" if left else " (navigation failed)"))
+        warnings.append(f"{why}. The checkout page was left so a late approval cannot place the order; "
+                        "if the bank still shows a prompt for this payment, decline it.")
+
+    async def _ua_await_outcome(self, steps, warnings, base, summary, total, monitor=None, before=None) -> Dict[str, Any]:
+        """After the click: log what the page does, handle 3-D Secure once
+        (SMS code or app approval), stop early on a rejection, and read the
+        order number from the real confirmation page only."""
+        start = time.monotonic()
+        deadline = start + config.UNATTENDED_RESULT_SECONDS
+        grace = min(10.0, config.UNATTENDED_RESULT_SECONDS / 2)
         three_ds_done = False
         looked_confirmed = False
+        pending = False
+        spinner = None
+        before = before or {}
+        seen_msgs = set(before.get("toasts") or []) | set(before.get("alerts") or [])
+        seen_modals = {m.get("popup") for m in (before.get("modals") or [])}
+        shown: List[str] = []
+        unknown = {"status": "outcome_unknown", "order_id": None}
         while time.monotonic() < deadline:
             await self._ua_sleep()
             if not self._is_alive():
                 warnings.append("the browser closed after the place-order click")
-                return {"status": "outcome_unknown", "order_id": None}
+                return unknown
             url = self.page.url
+            if monitor:
+                monitor.check_url(url)
             if is_confirmation_url(url):
                 looked_confirmed = True
                 order_id = parse_order_number(url, await self.page.content())
@@ -1790,18 +1936,64 @@ class ShufersalDriver:
                 state = await self._ua_state()
             except Exception:
                 continue  # navigating
+            post = await self._ua_post_state()
+            for m in (post.get("toasts") or []) + (post.get("alerts") or []):
+                if m not in seen_msgs:
+                    seen_msgs.add(m)
+                    shown.append(m)
+                    self._ua_log(steps, f"the site shows a message: {m[:160]}")
+            for m in post.get("modals") or []:
+                if m.get("popup") not in seen_modals:
+                    seen_modals.add(m.get("popup"))
+                    self._ua_log(steps, f"a popup opened: {m.get('popup')}: {str(m.get('text') or '')[:120]}")
+            if "spinner" in post:
+                now = bool(post["spinner"])
+                if now != spinner and (spinner is not None or now):
+                    self._ua_log(steps, "the site's spinner is " + ("shown" if now else "hidden"))
+                spinner = now
+            pending = self._payment_window_open(state, monitor)
             if state.get("errorPopup"):
                 self._ua_log(steps, "the site showed an error after the click")
                 warnings.append(f"the site showed an error after the place-order click: {state['errorPopup']}")
-                return {"status": "outcome_unknown", "order_id": None}
-            if state.get("threeDS") and not three_ds_done:
+                return unknown
+            result = monitor.last_result() if monitor else None
+            if (result and result.get("kind") in ("errors", "server_payment_error", "request_failed")
+                    and not monitor.in_flight() and not pending):
+                detail = ", ".join(result.get("errors") or []) or result.get("kind")
+                self._ua_log(steps, f"the site rejected the place-order request ({detail})")
+                warnings.append(f"the site answered the place-order request with an error ({detail})"
+                                + (f": {'; '.join(shown)[:300]}" if shown else "")
+                                + "; the order was most likely not placed, check the site's order list")
+                return unknown
+            if (shown and monitor and monitor.place_order_requests == 0 and not post.get("spinner")
+                    and not pending and time.monotonic() - start >= grace):
+                self._ua_log(steps, "the site showed a message and sent no place-order request")
+                warnings.append("the site stopped the order before sending it: " + "; ".join(shown)[:300])
+                return unknown
+            if pending and not three_ds_done:
                 three_ds_done = True
-                self._ua_log(steps, "3-D Secure challenge shown")
-                if not await self._ua_three_ds(steps, base, summary, total):
+                self._ua_log(steps, "3-D Secure challenge shown" if state.get("threeDS")
+                             else "a new window opened after the click; looking for the bank's page in it")
+                how = await self._ua_three_ds(steps, base, summary, total, monitor)
+                if how == "failed":
                     warnings.append("the 3-D Secure step could not be completed automatically")
-                    return {"status": "outcome_unknown", "order_id": None}
+                    await self._ua_diag(steps, "three-ds-failed", monitor, {"post_state": post})
+                    await self._ua_abandon_payment(steps, warnings, monitor, "the 3-D Secure step was not completed")
+                    return unknown
         self._ua_log(steps, "no confirmation page in time")
+        result = monitor.last_result() if monitor else None
+        if monitor is not None:
+            if monitor.place_order_requests == 0:
+                warnings.append("no place-order request was seen after the click"
+                                + (f"; the site showed: {'; '.join(shown)[:300]}" if shown else ""))
+            elif result and result.get("kind") == "success":
+                looked_confirmed = True
+                warnings.append("the site accepted the place-order request but the confirmation page was not read")
         warnings.append("no confirmation page was seen after the place-order click; check the site's order list")
+        if pending or (monitor is not None and self._payment_window_open({}, monitor)):
+            await self._ua_diag(steps, "timeout-bank-pending", monitor)
+            await self._ua_abandon_payment(steps, warnings, monitor,
+                                           "a 3-D Secure / bank approval was still open when the wait ended")
         return {"status": "placed_unconfirmed" if looked_confirmed else "outcome_unknown", "order_id": None}
 
     async def _await_handover(self) -> Dict[str, Any]:

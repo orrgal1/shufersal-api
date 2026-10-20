@@ -103,7 +103,12 @@ class FakeSite:
         self.checkout_popups = []          # popups the checkout page opens on load (closed by their X)
         self.checkout_cvv_field = False
         self.place_clicks = 0
-        self.after_click = "confirm"       # confirm | 3ds | error | nothing | confirm_no_number
+        # confirm | 3ds | error | nothing | confirm_no_number | 3ds_app | toast | rejected
+        # | accepted_no_nav | popup_3ds | spinner_forever
+        self.after_click = "confirm"
+        self.app_approve_reads = None      # 3ds_app: Or approves in the bank app after N url reads
+        self.three_ds_app = False          # the bank frame asks for app approval (no code field)
+        self.popup_page = None             # popup_3ds: the window the bank page opened in
         self.issuer_code = "771204"
         self.issuer_sender = "Isracard"
         self.issuer_amount = None          # None: the order total
@@ -137,6 +142,7 @@ class FakeSite:
         self.credit_notice_total_delta = 0.0  # the checkout total changes when it is dismissed
         self.credit_notice_clicks = 0
         self.events = []                   # ordered log: cost_summary, credit_notice_dismissed, place_click
+        self.screenshots = 0
 
     def expire_session(self):
         """The server forgets the session (idle timeout); takes effect on the next request."""
@@ -429,7 +435,18 @@ class FakeSite:
         if sel == "a.btnConfirm" and path.endswith("/miglog-checkout") and not ui["checkout_popups"]:
             self.place_clicks += 1
             self.events.append("place_click")
-            if self.after_click == "confirm":
+            mode = self.after_click
+            answers = {"confirm": {"success": True, "redirect": "/checkout/orderConfirmation/987654321"},
+                       "confirm_no_number": {"success": True, "redirect": "/checkout/orderConfirmation"},
+                       "accepted_no_nav": {"success": True, "redirect": "/checkout/orderConfirmation/987654321"},
+                       "3ds": {"directCreditCard3DSLink": "https://bank.example/acs?token=SECRET"},
+                       "3ds_app": {"directCreditCard3DSLink": "https://bank.example/acs?token=SECRET"},
+                       "error": {"allocationTimeout": True},
+                       "rejected": [{"type": "TIMESLOT_UNAVAILABLE", "code": "TIMESLOT_UNAVAILABLE"}],
+                       "spinner_forever": None}
+            if mode in answers:
+                page.emit_place_order(answers[mode])
+            if mode == "confirm":
                 self.orders_placed += 1
                 page._url = self.confirmation_url
             elif self.after_click == "confirm_no_number":
@@ -446,8 +463,30 @@ class FakeSite:
                         "תמיד לשירותך, ישראכרט"))
             elif self.after_click == "error":
                 ui["error_popup"] = "אירעה שגיאה בתשלום"
+            elif mode == "3ds_app":
+                ui["three_ds"] = True
+                self.three_ds_app = True
+            elif mode == "toast":
+                ui["toasts"] = ["יש לבחור מועד משלוח"]
+            elif mode == "rejected":
+                ui["alerts"] = ["המועד שבחרת אינו זמין יותר"]
+            elif mode == "spinner_forever":
+                ui["spinner"] = True
+            elif mode == "popup_3ds":
+                popup = FakePopupPage(self, page)
+                self.popup_page = popup
+                page.emit("popup", popup)
+                if self.send_issuer_sms:
+                    self.sms.add(self.issuer_sender, (
+                        f"זיהינו כעת עסקה בסכום {self.order_total():.2f} ILS ב {self.issuer_merchant} "
+                        f"בכרטיסך {self.issuer_last4}, הקוד שלך להשלמת העסקה הינו {self.issuer_code}"))
             return True
         return False
+
+    def post_state(self, page):
+        ui = self.ui
+        return {"toasts": list(ui.get("toasts", [])), "alerts": list(ui.get("alerts", [])), "modals": [],
+                "iframes": [], "spinner": bool(ui.get("spinner")), "threeDS": bool(ui["three_ds"])}
 
     def ui_fill(self, page, sel, value):
         if sel == "#smsCodeInput" and self.ui["modal"] == "pwd":
@@ -478,6 +517,8 @@ class FakeSite:
             return "no-submit:2"
         self.three_ds_codes.append(code)
         self.ui["three_ds"] = False
+        if self.popup_page is not None:
+            self.popup_page.closed = True
         if code == self.issuer_code:
             self.orders_placed += 1
             page._url = self.confirmation_url
@@ -512,7 +553,11 @@ class FakeFrame:
 
     async def evaluate(self, script, args=None):
         if "/*ua-3ds-probe*/" in script:
+            if self.site.three_ds_app:
+                return {"inputs": 0, "appWait": True, "text": "אשרו את העסקה באפליקציה"}
             return {"inputs": self.site.three_ds_inputs}
+        if "/*ua-dom-snapshot*/" in script:
+            return "<html><body>bank page <input></body></html>"
         if "/*ua-3ds-submit*/" in script:
             return self.site.three_ds_submit(self.page, args)
         raise AssertionError("unexpected frame script")
@@ -538,6 +583,14 @@ class FakePage:
 
     @property
     def url(self):
+        site = self.site
+        if site.app_approve_reads is not None and site.ui["three_ds"] and site.three_ds_app:
+            if site.app_approve_reads <= 0:  # Or approved in the bank app; the site re-placed the order
+                site.ui["three_ds"] = False
+                site.orders_placed += 1
+                self._url = site.confirmation_url
+            else:
+                site.app_approve_reads -= 1
         n = self.site.confirm_on_url_reads
         if n is not None and ("/checkout" in self._url or "/cart/cartsummary" in self._url):
             if n <= 0:
@@ -555,6 +608,30 @@ class FakePage:
 
     def on(self, event, fn):
         self.handlers.setdefault(event, []).append(fn)
+
+    def remove_listener(self, event, fn):
+        if fn in self.handlers.get(event, []):
+            self.handlers[event].remove(fn)
+
+    def emit(self, event, obj):
+        for fn in list(self.handlers.get(event, [])):
+            fn(obj)
+
+    def emit_place_order(self, answer, after3ds=False):
+        """The site's GET placeOrder as Playwright request/response events."""
+        url = (BASE + "/online/he/checkout/placeOrder?jwtPayme=SECRETJWT&after3ds="
+               + ("true" if after3ds else "false"))
+        self.emit("request", types.SimpleNamespace(url=url))
+        if answer is None:
+            return  # still in flight
+
+        async def text():
+            return json.dumps(answer)
+        self.emit("response", types.SimpleNamespace(url=url, status=200, text=text))
+
+    async def screenshot(self, **kwargs):
+        self.site.screenshots += 1
+        return b"\x89PNG fake"
 
     def close_unexpectedly(self):
         self.closed = True
@@ -587,6 +664,10 @@ class FakePage:
             raise Exception("Target page, context or browser has been closed")
         if "/*ua-state*/" in script:
             return self.site.ui_state(self)
+        if "/*ua-post*/" in script:
+            return self.site.post_state(self)
+        if "/*ua-dom-snapshot*/" in script:
+            return "<html><body>checkout page</body></html>"
         if "/*ua-click*/" in script:
             return self.site.ui_click(self, args)
         if "/*ua-fill*/" in script:
@@ -622,6 +703,25 @@ class FakePage:
             return {"status": 200, "url": BASE + "/online/he", "redirected": True, "text": "<!DOCTYPE html><html></html>"}
         status, final, text = self.site.handle(url, method, body, content_type)
         return {"status": status, "url": final, "redirected": False, "text": text}
+
+
+class FakePopupPage:
+    """A window opened after the click, holding the bank's page."""
+
+    def __init__(self, site, main_page):
+        self.site, self.closed = site, False
+        self.url = "https://bank.example/acs?token=SECRET"
+        self.frames = [FakeFrame(site, main_page)]
+
+    def is_closed(self):
+        return self.closed
+
+    async def close(self):
+        self.closed = True
+
+    async def screenshot(self, **kwargs):
+        self.site.screenshots += 1
+        return b"\x89PNG popup"
 
 
 class FakeContext:

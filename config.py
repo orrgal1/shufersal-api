@@ -54,6 +54,10 @@ LIVE_CHECKOUT_ENABLED = os.getenv("SHUFERSAL_LIVE_CHECKOUT_ENABLED", "false").st
 CHECKOUT_LEDGER = os.getenv("SHUFERSAL_CHECKOUT_LEDGER",
                             str(Path(__file__).resolve().parent / ".runtime" / "checkout_ledger.sqlite3"))
 
+# Unattended checkout diagnostics (masked screenshot, sanitized DOM, post-click
+# events) saved when the outcome after the place-order click is not confirmed.
+DIAG_DIR = os.getenv("SHUFERSAL_DIAG_DIR", str(Path(__file__).resolve().parent / ".runtime" / "diag"))
+
 # Watched checkout: the browser is relaunched visible for the checkout step and
 # the service waits this long for Or to finish payment and place the order.
 WATCH_TIMEOUT_SECONDS = int(os.getenv("SHUFERSAL_WATCH_TIMEOUT_SECONDS", "900"))
